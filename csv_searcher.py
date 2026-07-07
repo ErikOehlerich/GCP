@@ -210,6 +210,7 @@ class CsvSearcherGUI(QMainWindow):
         self.search_thread = None
         self.search_worker = None
         self.current_results = []
+        self.all_columns = []  # Dynamiske kolonner fra CSV-filer
         
         self.init_ui()
         self.load_cache()  # Load cached folder path
@@ -330,10 +331,19 @@ class CsvSearcherGUI(QMainWindow):
         self.progress_bar.setVisible(False)
         main_layout.addWidget(self.progress_bar)
         
-        # Results table
+        # Results table with search
         results_label = QLabel("Resultater (dobbeltklik for detaljer):")
         results_label.setFont(QFont("Arial", 11, QFont.Bold))
         main_layout.addWidget(results_label)
+        
+        # Search box for results
+        search_results_layout = QHBoxLayout()
+        search_results_layout.addWidget(QLabel("Søg i resultater:"))
+        self.search_results = QLineEdit()
+        self.search_results.setPlaceholderText("Skriv for at filtrere resultater i realtid...")
+        self.search_results.textChanged.connect(self.filter_results_table)
+        search_results_layout.addWidget(self.search_results)
+        main_layout.addLayout(search_results_layout)
         
         self.results_table = QTableWidget()
         self.results_table.setColumnCount(8)
@@ -343,6 +353,12 @@ class CsvSearcherGUI(QMainWindow):
         ])
         self.results_table.setColumnWidth(1, 180)
         self.results_table.setColumnWidth(5, 150)
+        # Enable sorting
+        self.results_table.setSortingEnabled(True)
+        # Enable column moving/rearranging
+        self.results_table.horizontalHeader().setSectionsMovable(True)
+        # Enable column resizing
+        self.results_table.horizontalHeader().setStretchLastSection(False)
         self.results_table.doubleClicked.connect(self.show_details)
         main_layout.addWidget(self.results_table)
         
@@ -376,6 +392,28 @@ class CsvSearcherGUI(QMainWindow):
         self.setStatusBar(self.statusBar)
         self.statusBar.showMessage("Klar til søgning...")
     
+
+    def get_all_columns(self) -> List[str]:
+        """Discover all unique columns from CSV files"""
+        if not self.csv_folder:
+            return []
+        
+        columns = set()
+        try:
+            csv_files = list(Path(self.csv_folder).glob("**/*.csv"))
+            for csv_file in csv_files[:20]:  # Sample first 20 files
+                try:
+                    with open(csv_file, 'r', encoding='latin-1', errors='replace') as f:
+                        reader = csv.DictReader(f, delimiter=';')
+                        if reader.fieldnames:
+                            columns.update([col.strip() for col in reader.fieldnames])
+                except:
+                    pass
+        except:
+            pass
+        
+        return sorted(list(columns))
+
     def browse_folder(self):
         """Browse for CSV folder"""
         folder = QFileDialog.getExistingDirectory(self, "Vælg mappe med CSV-filer")
@@ -459,26 +497,47 @@ class CsvSearcherGUI(QMainWindow):
         self.statusBar.showMessage(message)
     
     def display_results(self, results: List[Dict]):
-        """Display search results in table"""
+        """Display search results in table with all columns"""
         self.current_results = results
+        # Clear search filter when new results are displayed
+        if hasattr(self, 'search_results'):
+            self.search_results.blockSignals(True)
+            self.search_results.clear()
+            self.search_results.blockSignals(False)
+        
+        # Find all unique columns from results, filtering out complex types and metadata
+        all_cols = set()
+        for result in results:
+            for k, v in result.items():
+                # Skip internal metadata columns
+                if k.startswith('_'):
+                    continue
+                # Skip complex data types (lists, dicts, etc) - only keep simple types
+                if isinstance(v, (list, dict, tuple)):
+                    continue
+                # Skip if value looks like serialized data (starts with [ or { or contains lots of special chars)
+                v_str = str(v).strip()
+                if v_str.startswith('[') or v_str.startswith('{') or len(v_str) > 500:
+                    continue
+                all_cols.add(k)
+        
+        # Sort columns, with common ones first
+        priority_cols = ['Kildenavn', 'Køn', 'Alder', 'Civilstand', 'Fødeår', 
+                        'Kildefødested', 'Stilling_i_husstanden', 'Kildeerhverv']
+        sorted_cols = [c for c in priority_cols if c in all_cols]
+        sorted_cols += sorted([c for c in all_cols if c not in priority_cols])
+        
+        self.all_columns = sorted_cols
+        self.results_table.setColumnCount(len(sorted_cols))
+        self.results_table.setHorizontalHeaderLabels(sorted_cols)
         self.results_table.setRowCount(len(results))
         
-        column_mapping = {
-            0: '_fil',
-            1: 'Kildenavn',
-            2: 'Køn',
-            3: 'Alder',
-            4: 'Civilstand',
-            5: 'Kildefødested',
-            6: 'Fødeår',
-            7: 'Stilling_i_husstanden'
-        }
+        # Auto-resize columns
+        for col_idx, col_name in enumerate(sorted_cols):
+            self.results_table.setColumnWidth(col_idx, max(100, len(col_name) * 8))
         
         for row, result in enumerate(results):
-            for col, key in column_mapping.items():
-                value = str(result.get(key, '')).strip()
-                item = QTableWidgetItem(value)
-                self.results_table.setItem(row, col, item)
+            self._populate_table_row(row, result)
     
     def show_file_browser(self):
         """Show all files in the folder"""
@@ -580,15 +639,23 @@ class CsvSearcherGUI(QMainWindow):
         person_layout.addWidget(QLabel(f"<h2>{person.get('Kildenavn', 'Ukendt')}</h2>"))
         
         person_html = "<table border='1' cellpadding='8' cellspacing='0' style='width:100%; background-color:#f9f9f9;'>"
-        person_html += "<tr style='background-color:#4CAF50; color:white;'><th style='text-align:left;'>Felt</th><th style='text-align:left;'>Værdi</th></tr>"
+        person_html += "<tr style='background-color:#4CAF50; color:white;'><th style='text-align:left;'>Kategori</th><th style='text-align:left;'>Værdi</th></tr>"
         
-        for key, value in sorted(person.items()):
-            if not key.startswith('_') and pd.notna(value):
+        # Vis alle kolonner sorteret, men filtrer komplekse datatyper
+        all_keys = sorted([k for k in person.keys() if not k.startswith('_')])
+        row_count = 0
+        for key in all_keys:
+            value = person.get(key, '')
+            # Skip complex data types
+            if isinstance(value, (list, dict, tuple)):
+                continue
+            if value is not None:
                 value_str = str(value).strip()
-                if value_str:
+                if value_str and value_str.lower() != 'nan':
                     display_key = key.replace('_', ' ')
-                    bg_color = "#f0f0f0" if len(person_html) % 2 == 0 else "#ffffff"
+                    bg_color = "#f0f0f0" if row_count % 2 == 0 else "#ffffff"
                     person_html += f"<tr style='background-color:{bg_color};'><td style='font-weight:bold; width:30%;'>{display_key}:</td><td>{value_str}</td></tr>"
+                    row_count += 1
         
         person_html += "</table><br><h3>Kildeoplysninger:</h3>"
         person_html += f"<p><b>Fil:</b> {person.get('_fil', 'Ukendt')}</p>"
@@ -624,17 +691,21 @@ class CsvSearcherGUI(QMainWindow):
                 household_layout.addWidget(QLabel(f"<h2>Husstanden ({len(household_members)} personer)</h2>"))
                 
                 household_table = QTableWidget()
-                household_table.setColumnCount(12)
-                household_table.setHorizontalHeaderLabels([
-                    "Navn", "Køn", "Alder", "Fødested", "Fødeår", "Civilstand",
-                    "Erhverv", "Stilling", "Bopæl", "Født (dato)", "KIPnr", "Lbr"
-                ])
+                # Dynamisk kolonner til husstanden
+                household_cols = set()
+                for member in household_members:
+                    household_cols.update([k for k in member.keys() if not k.startswith('_')])
+                
+                priority_household_cols = ['Kildenavn', 'Køn', 'Alder', 'Kildefødested', 'Fødeår', 'Civilstand',
+                                          'Kildeerhverv', 'Stilling_i_husstanden', 'Kildestednavn', 'Født kildedato']
+                sorted_household_cols = [c for c in priority_household_cols if c in household_cols]
+                sorted_household_cols += sorted([c for c in household_cols if c not in priority_household_cols])
+                
+                household_table.setColumnCount(len(sorted_household_cols))
+                household_table.setHorizontalHeaderLabels(sorted_household_cols)
                 household_table.setRowCount(len(household_members))
                 
-                columns = [
-                    'Kildenavn', 'Køn', 'Alder', 'Kildefødested', 'Fødeår', 'Civilstand',
-                    'Kildeerhverv', 'Stilling_i_husstanden', 'Kildestednavn', 'Født kildedato', 'KIPnr', 'Løbenr'
-                ]
+                columns = sorted_household_cols
                 
                 for row, member in enumerate(household_members):
                     for col, field in enumerate(columns):
@@ -655,9 +726,14 @@ class CsvSearcherGUI(QMainWindow):
                     member_html = f"<h4>{idx + 1}. {member.get('Kildenavn', 'Ukendt')}</h4>"
                     member_html += "<table border='1' cellpadding='5' style='width:100%;'>"
                     for key, value in sorted(member.items()):
-                        if not key.startswith('_') and pd.notna(value):
+                        # Skip internal columns and complex data types
+                        if key.startswith('_'):
+                            continue
+                        if isinstance(value, (list, dict, tuple)):
+                            continue
+                        if pd.notna(value):
                             value_str = str(value).strip()
-                            if value_str:
+                            if value_str and value_str.lower() != 'nan':
                                 member_html += f"<tr><td style='font-weight:bold; width:25%;'>{key.replace('_', ' ')}:</td><td>{value_str}</td></tr>"
                     member_html += "</table><br>"
                     lbl = QLabel(member_html)
@@ -721,6 +797,55 @@ class CsvSearcherGUI(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Eksport Fejl", f"Kunne ikke gemme filen:\n{str(e)}")
 
+    def filter_results_table(self, search_text: str):
+        """Filter results table based on search text"""
+        search_text = search_text.lower().strip()
+        
+        if not hasattr(self, 'results_table') or not self.current_results:
+            return
+        
+        # If search is empty, show all rows
+        if not search_text:
+            self.results_table.setRowCount(len(self.current_results))
+            for row, result in enumerate(self.current_results):
+                self._populate_table_row(row, result)
+            return
+        
+        # Filter results that contain search text
+        filtered_results = []
+        for result in self.current_results:
+            # Search in all visible columns
+            found = False
+            for value in result.values():
+                if value and search_text in str(value).lower():
+                    found = True
+                    break
+            if found:
+                filtered_results.append(result)
+        
+        # Update table with filtered results
+        self.results_table.setRowCount(len(filtered_results))
+        for row, result in enumerate(filtered_results):
+            self._populate_table_row(row, result)
+    
+    def _populate_table_row(self, row: int, result: Dict):
+        """Helper method to populate a table row with result data"""
+        if not hasattr(self, 'all_columns'):
+            return
+        
+        for col_idx, col_name in enumerate(self.all_columns):
+            raw_value = result.get(col_name, '')
+            # Skip complex data types
+            if isinstance(raw_value, (list, dict, tuple)):
+                value = ''
+            else:
+                value = str(raw_value).strip()
+                # Skip if looks like serialized data
+                if value.startswith('[') or value.startswith('{'):
+                    value = ''
+            item = QTableWidgetItem(value)
+            self.results_table.setItem(row, col_idx, item)
+
     def search_finished(self):
         """Called when search is finished"""
         self.search_btn.setEnabled(True)
@@ -742,11 +867,12 @@ class CsvSearcherGUI(QMainWindow):
         
         diag_window = QDialog(self)
         diag_window.setWindowTitle("Diagnostics & Søgetips")
-        diag_window.setGeometry(100, 100, 800, 500)
+        diag_window.setGeometry(100, 100, 900, 600)
         
         layout = QVBoxLayout()
         tabs = QTabWidget()
         
+        # Tab 1: System status
         overview_scroll = QScrollArea()
         overview_scroll.setWidgetResizable(True)
         overview_widget = QWidget()
@@ -759,10 +885,6 @@ class CsvSearcherGUI(QMainWindow):
             info_text += f"<p><b>Antal CSV-filer fundet:</b> {len(csv_files)}</p>"
             if csv_files:
                 info_text += f"<p><b>Eksempel på filstruktur:</b> {csv_files[0].name}</p>"
-                # Læs overskrifter fra første fil som test
-                with open(csv_files[0], 'r', encoding='latin-1', errors='replace') as f:
-                    first_line = f.readline().strip()
-                    info_text += f"<p><b>Kolonner fundet i filen:</b><br><small style='color: #555;'>{first_line}</small></p>"
         except Exception as e:
             info_text += f"<p style='color:red;'>Kunne ikke hente statistikker: {e}</p>"
             
@@ -774,6 +896,42 @@ class CsvSearcherGUI(QMainWindow):
         overview_scroll.setWidget(overview_widget)
         
         tabs.addTab(overview_scroll, "System status")
+        
+        # Tab 2: Tilgængelige kolonner
+        cols_scroll = QScrollArea()
+        cols_scroll.setWidgetResizable(True)
+        cols_widget = QWidget()
+        cols_layout = QVBoxLayout()
+        
+        cols_text = "<h2>Tilgængelige kolonner i dataene</h2>"
+        try:
+            csv_files = list(Path(self.csv_folder).glob("**/*.csv"))
+            if csv_files:
+                all_columns = set()
+                with open(csv_files[0], 'r', encoding='latin-1', errors='replace') as f:
+                    import csv
+                    reader = csv.DictReader(f, delimiter=';')
+                    if reader.fieldnames:
+                        all_columns.update([col.strip() for col in reader.fieldnames])
+                
+                if all_columns:
+                    cols_text += f"<p><b>Kolonner fundet ({len(all_columns)}):</b></p><ul>"
+                    for col in sorted(all_columns):
+                        cols_text += f"<li>{col}</li>"
+                    cols_text += "</ul>"
+                else:
+                    cols_text += "<p style='color:red;'>Ingen kolonner fundet</p>"
+        except Exception as e:
+            cols_text += f"<p style='color:red;'>Fejl: {e}</p>"
+        
+        cols_lbl = QLabel(cols_text)
+        cols_lbl.setWordWrap(True)
+        cols_layout.addWidget(cols_lbl)
+        cols_layout.addStretch()
+        cols_widget.setLayout(cols_layout)
+        cols_scroll.setWidget(cols_widget)
+        
+        tabs.addTab(cols_scroll, "Kolonner")
         layout.addWidget(tabs)
         
         close_btn = QPushButton("Luk")
