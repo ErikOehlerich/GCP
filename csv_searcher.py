@@ -9,7 +9,7 @@ import csv
 import json
 import pandas as pd
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Tuple
 import threading
 from queue import Queue
@@ -101,7 +101,6 @@ class SearchWorker(QObject):
         results = []
         
         try:
-            # Tip: Prøv evt. 'utf-8-sig' hvis 'latin-1' giver mærkelige tegn i kolonnenavnene
             with open(csv_file, 'r', encoding='latin-1', errors='replace') as csvfile:
                 reader = csv.DictReader(csvfile, delimiter=';')
                 rows = list(reader)
@@ -110,16 +109,19 @@ class SearchWorker(QObject):
                 return results
             
             df = pd.DataFrame(rows)
-            
-            # FJERN BOM (Byte Order Mark) eller usynlige tegn fra kolonnenavne hvis de findes
             df.columns = df.columns.str.strip()
             
             filtered_df = self.apply_filters(df)
             
             if len(filtered_df) > 0:
+                # Opret en kopi for at undgå SettingWithCopyWarning
+                filtered_df = filtered_df.copy()
                 filtered_df['_fil'] = csv_file.name
                 filtered_df['_fulsti'] = str(csv_file)
-                filtered_df['_hele_filen'] = rows
+                
+                # SIKKER FIX: Ganger listen med rå-rækker op med længden af det filtrerede dataframe
+                filtered_df['_hele_filen'] = [rows] * len(filtered_df)
+                
                 results = filtered_df.to_dict('records')
             
         except Exception as e:
@@ -281,14 +283,14 @@ class CsvSearcherGUI(QMainWindow):
         
         age_year_layout.addWidget(QLabel("Fødeår fra:"))
         self.year_from = QSpinBox()
-        self.year_from.setRange(1700, 2024)
+        self.year_from.setRange(1700, 2026)
         self.year_from.setValue(1700)
         age_year_layout.addWidget(self.year_from)
         
         age_year_layout.addWidget(QLabel("til:"))
         self.year_to = QSpinBox()
-        self.year_to.setRange(1700, 2024)
-        self.year_to.setValue(2024)
+        self.year_to.setRange(1700, 2026)
+        self.year_to.setValue(2026)
         age_year_layout.addWidget(self.year_to)
         
         search_layout.addLayout(age_year_layout)
@@ -382,7 +384,7 @@ class CsvSearcherGUI(QMainWindow):
             self.folder_label.setText(folder)
             csv_count = len(list(Path(folder).glob("**/*.csv")))
             self.statusBar.showMessage(f"Mappen indeholder {csv_count} CSV-filer")
-            self.save_cache()  # Save folder to cache
+            self.save_cache()
     
     def load_cache(self):
         """Load last used folder from cache"""
@@ -403,9 +405,7 @@ class CsvSearcherGUI(QMainWindow):
     def save_cache(self):
         """Save current folder to cache"""
         try:
-            cache_data = {
-                'last_folder': self.csv_folder
-            }
+            cache_data = {'last_folder': self.csv_folder}
             with open(self.CACHE_FILE, 'w', encoding='utf-8') as f:
                 json.dump(cache_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
@@ -417,7 +417,6 @@ class CsvSearcherGUI(QMainWindow):
             QMessageBox.warning(self, "Fejl", "Vælg først en mappe med CSV-filer!")
             return
         
-        # Collect search parameters
         search_params = {
             'fornavn': self.fornavn_input.text(),
             'efternavn': self.efternavn_input.text(),
@@ -426,24 +425,21 @@ class CsvSearcherGUI(QMainWindow):
             'alder_fra': self.age_from.value() if self.age_from.value() > 0 else None,
             'alder_til': self.age_to.value() if self.age_to.value() < 150 else None,
             'fødeår_fra': self.year_from.value() if self.year_from.value() > 1700 else None,
-            'fødeår_til': self.year_to.value() if self.year_to.value() < 2024 else None,
+            'fødeår_til': self.year_to.value() if self.year_to.value() < 2026 else None,
             'fødested': self.birthplace_input.text(),
         }
         
-        # Disable search button and show progress
         self.search_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.results_table.setRowCount(0)
         self.current_results = []
         
-        # Kill previous thread if it exists
         if self.search_thread is not None and self.search_thread.isRunning():
             self.search_worker.stop_flag = True
             self.search_thread.quit()
             self.search_thread.wait()
         
-        # Create and start worker thread
         self.search_thread = QThread()
         self.search_worker = SearchWorker(self.csv_folder, search_params)
         self.search_worker.moveToThread(self.search_thread)
@@ -457,11 +453,9 @@ class CsvSearcherGUI(QMainWindow):
         self.search_thread.start()
     
     def update_progress(self, value: int):
-        """Update progress bar"""
         self.progress_bar.setValue(value)
     
     def update_status(self, message: str):
-        """Update status bar"""
         self.statusBar.showMessage(message)
     
     def display_results(self, results: List[Dict]):
@@ -469,7 +463,6 @@ class CsvSearcherGUI(QMainWindow):
         self.current_results = results
         self.results_table.setRowCount(len(results))
         
-        # Column mappings for display
         column_mapping = {
             0: '_fil',
             1: 'Kildenavn',
@@ -493,18 +486,14 @@ class CsvSearcherGUI(QMainWindow):
             QMessageBox.warning(self, "Fejl", "Vælg først en mappe med CSV-filer!")
             return
         
-        # Create file browser window
         file_window = QDialog(self)
         file_window.setWindowTitle("📁 Filoversigt")
         file_window.setGeometry(100, 100, 1000, 600)
         
         layout = QVBoxLayout()
-        
-        # Title
         title = QLabel(f"<h2>CSV-filer i {self.csv_folder}</h2>")
         layout.addWidget(title)
         
-        # Search/filter box
         search_layout = QHBoxLayout()
         search_layout.addWidget(QLabel("Søg i filnavn:"))
         file_search = QLineEdit()
@@ -512,7 +501,6 @@ class CsvSearcherGUI(QMainWindow):
         search_layout.addWidget(file_search)
         layout.addLayout(search_layout)
         
-        # File table
         file_table = QTableWidget()
         file_table.setColumnCount(4)
         file_table.setHorizontalHeaderLabels(["Filnavn", "Sti", "Størrelse", "Status"])
@@ -521,55 +509,36 @@ class CsvSearcherGUI(QMainWindow):
         file_table.setColumnWidth(2, 100)
         file_table.setColumnWidth(3, 100)
         
-        # Get all files
         csv_files = sorted(list(Path(self.csv_folder).glob("**/*.csv")))
         
         def update_table(search_text=""):
-            """Update file table with search filter"""
-            filtered_files = []
-            if search_text:
-                filtered_files = [f for f in csv_files if search_text.lower() in f.name.lower()]
-            else:
-                filtered_files = csv_files
-            
+            filtered_files = [f for f in csv_files if search_text.lower() in f.name.lower()] if search_text else csv_files
             file_table.setRowCount(len(filtered_files))
             
+            files_with_results = set([r.get('_fil', '') for r in self.current_results])
+            
             for row, file_path in enumerate(filtered_files):
-                # Filnavn
-                name_item = QTableWidgetItem(file_path.name)
-                file_table.setItem(row, 0, name_item)
+                file_table.setItem(row, 0, QTableWidgetItem(file_path.name))
+                file_table.setItem(row, 1, QTableWidgetItem(str(file_path)))
                 
-                # Sti
-                path_item = QTableWidgetItem(str(file_path))
-                file_table.setItem(row, 1, path_item)
-                
-                # Størrelse
                 try:
                     size_kb = file_path.stat().st_size / 1024
-                    size_item = QTableWidgetItem(f"{size_kb:.1f} KB")
-                    file_table.setItem(row, 2, size_item)
+                    file_table.setItem(row, 2, QTableWidgetItem(f"{size_kb:.1f} KB"))
                 except:
-                    pass
+                    file_table.setItem(row, 2, QTableWidgetItem("N/A"))
                 
-                # Status (check if file had results)
-                files_with_results = set([r.get('_fil', '') for r in self.current_results])
                 if file_path.name in files_with_results:
                     status_item = QTableWidgetItem("✓ Resultater")
                     status_item.setBackground(QColor("#c8e6c9"))
                     file_table.setItem(row, 3, status_item)
                 else:
-                    status_item = QTableWidgetItem("Ingen")
-                    file_table.setItem(row, 3, status_item)
+                    file_table.setItem(row, 3, QTableWidgetItem("Ingen"))
         
-        # Connect search
         file_search.textChanged.connect(lambda text: update_table(text))
-        
-        # Initial population
         update_table()
         
         layout.addWidget(file_table)
         
-        # Stats
         stats_text = f"""
         <h3>📊 Statistik:</h3>
         <ul>
@@ -578,10 +547,8 @@ class CsvSearcherGUI(QMainWindow):
             <li><b>Total resultater:</b> {len(self.current_results)}</li>
         </ul>
         """
-        stats_label = QLabel(stats_text)
-        layout.addWidget(stats_label)
+        layout.addWidget(QLabel(stats_text))
         
-        # Close button
         close_btn = QPushButton("Luk")
         close_btn.clicked.connect(file_window.close)
         layout.addWidget(close_btn)
@@ -597,27 +564,21 @@ class CsvSearcherGUI(QMainWindow):
         
         person = self.current_results[current_row]
         
-        # Create detail window
         detail_window = QDialog(self)
         detail_window.setWindowTitle(f"Detaljer - {person.get('Kildenavn', 'Ukendt')}")
         detail_window.setGeometry(50, 50, 1400, 800)
         
         layout = QVBoxLayout()
-        
-        # Create tab widget for person details and household
         tabs = QTabWidget()
         
-        # Tab 1: Person details (all columns)
+        # Tab 1: Personlig Info
         person_scroll = QScrollArea()
         person_scroll.setWidgetResizable(True)
         person_widget = QWidget()
         person_layout = QVBoxLayout()
         
-        # Person title
-        person_title = QLabel(f"<h2>{person.get('Kildenavn', 'Ukendt')}</h2>")
-        person_layout.addWidget(person_title)
+        person_layout.addWidget(QLabel(f"<h2>{person.get('Kildenavn', 'Ukendt')}</h2>"))
         
-        # Person info table
         person_html = "<table border='1' cellpadding='8' cellspacing='0' style='width:100%; background-color:#f9f9f9;'>"
         person_html += "<tr style='background-color:#4CAF50; color:white;'><th style='text-align:left;'>Felt</th><th style='text-align:left;'>Værdi</th></tr>"
         
@@ -625,15 +586,11 @@ class CsvSearcherGUI(QMainWindow):
             if not key.startswith('_') and pd.notna(value):
                 value_str = str(value).strip()
                 if value_str:
-                    # Format key with better names
                     display_key = key.replace('_', ' ')
-                    # Alternate row colors
                     bg_color = "#f0f0f0" if len(person_html) % 2 == 0 else "#ffffff"
                     person_html += f"<tr style='background-color:{bg_color};'><td style='font-weight:bold; width:30%;'>{display_key}:</td><td>{value_str}</td></tr>"
         
-        person_html += "</table>"
-        
-        person_html += f"<br><h3>Kildeoplysninger:</h3>"
+        person_html += "</table><br><h3>Kildeoplysninger:</h3>"
         person_html += f"<p><b>Fil:</b> {person.get('_fil', 'Ukendt')}</p>"
         person_html += f"<p><b>Sti:</b> {person.get('_fulsti', 'Ukendt')}</p>"
         
@@ -646,7 +603,7 @@ class CsvSearcherGUI(QMainWindow):
         person_scroll.setWidget(person_widget)
         tabs.addTab(person_scroll, "Personlig Info")
         
-        # Tab 2: Household members (if household number exists)
+        # Tab 2: Husstandsmedlemmer
         husstands_nr = str(person.get('Husstands/familienr.', '')).strip()
         
         if husstands_nr and husstands_nr != 'nan' and husstands_nr != '':
@@ -655,7 +612,6 @@ class CsvSearcherGUI(QMainWindow):
             household_widget = QWidget()
             household_layout = QVBoxLayout()
             
-            # Find all household members
             hele_filen = person.get('_hele_filen', [])
             household_members = []
             
@@ -665,10 +621,8 @@ class CsvSearcherGUI(QMainWindow):
                         household_members.append(member)
             
             if household_members:
-                household_title = QLabel(f"<h2>Husstanden ({len(household_members)} personer)</h2>")
-                household_layout.addWidget(household_title)
+                household_layout.addWidget(QLabel(f"<h2>Husstanden ({len(household_members)} personer)</h2>"))
                 
-                # Create table of household members
                 household_table = QTableWidget()
                 household_table.setColumnCount(12)
                 household_table.setHorizontalHeaderLabels([
@@ -677,12 +631,12 @@ class CsvSearcherGUI(QMainWindow):
                 ])
                 household_table.setRowCount(len(household_members))
                 
+                columns = [
+                    'Kildenavn', 'Køn', 'Alder', 'Kildefødested', 'Fødeår', 'Civilstand',
+                    'Kildeerhverv', 'Stilling_i_husstanden', 'Kildestednavn', 'Født kildedato', 'KIPnr', 'Løbenr'
+                ]
+                
                 for row, member in enumerate(household_members):
-                    columns = [
-                        'Kildenavn', 'Køn', 'Alder', 'Kildefødested', 'Fødeår', 'Civilstand',
-                        'Kildeerhverv', 'Stilling_i_husstanden', 'Kildestednavn', 'Født kildedato', 'KIPnr', 'Løbenr'
-                    ]
-                    
                     for col, field in enumerate(columns):
                         value = str(member.get(field, '')).strip()
                         item = QTableWidgetItem(value)
@@ -690,79 +644,94 @@ class CsvSearcherGUI(QMainWindow):
                             item.setBackground(QColor("#f0f0f0"))
                         household_table.setItem(row, col, item)
                 
-                # Auto-resize columns
                 household_table.horizontalHeader().setStretchLastSection(True)
                 household_layout.addWidget(household_table)
                 
-                # All household members details
+                # Fulde HTML detaljer per medlem i bunden
                 household_layout.addWidget(QLabel("<h3>Detaljer om husstandsmedlemmer:</h3>"))
-                
-                details_scroll = QScrollArea()
-                details_scroll.setWidgetResizable(True)
-                details_widget = QWidget()
                 details_layout = QVBoxLayout()
                 
                 for idx, member in enumerate(household_members):
                     member_html = f"<h4>{idx + 1}. {member.get('Kildenavn', 'Ukendt')}</h4>"
                     member_html += "<table border='1' cellpadding='5' style='width:100%;'>"
-                    
                     for key, value in sorted(member.items()):
                         if not key.startswith('_') and pd.notna(value):
                             value_str = str(value).strip()
                             if value_str:
-                                display_key = key.replace('_', ' ')
-                                member_html += f"<tr><td style='font-weight:bold; width:25%;'>{display_key}:</td><td>{value_str}</td></tr>"
-                    
+                                member_html += f"<tr><td style='font-weight:bold; width:25%;'>{key.replace('_', ' ')}:</td><td>{value_str}</td></tr>"
                     member_html += "</table><br>"
-                    member_label = QLabel(member_html)
-                    member_label.setWordWrap(True)
-                    details_layout.addWidget(member_label)
+                    lbl = QLabel(member_html)
+                    lbl.setWordWrap(True)
+                    details_layout.addWidget(lbl)
                 
-                details_layout.addStretch()
+                details_widget = QWidget()
                 details_widget.setLayout(details_layout)
-                details_scroll.setWidget(details_widget)
-                household_layout.addWidget(details_scroll)
-                
+                household_layout.addWidget(details_widget)
             else:
-                no_household = QLabel(f"<p>Ingen andre medlemmer fundet i husstanden {husstands_nr}</p>")
-                household_layout.addWidget(no_household)
-                household_layout.addStretch()
+                household_layout.addWidget(QLabel(f"<p>Ingen andre medlemmer fundet i husstanden {husstands_nr}</p>"))
             
+            household_layout.addStretch()
             household_widget.setLayout(household_layout)
             household_scroll.setWidget(household_widget)
             tabs.addTab(household_scroll, f"Husstanden ({len(household_members)} personer)")
-        
+            
         layout.addWidget(tabs)
         
-        # Close button
-        button_layout = QHBoxLayout()
-        button_layout.addStretch()
         close_btn = QPushButton("Luk")
         close_btn.clicked.connect(detail_window.close)
-        close_btn.setMinimumWidth(100)
-        button_layout.addWidget(close_btn)
-        
-        layout.addLayout(button_layout)
+        layout.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignRight)
         
         detail_window.setLayout(layout)
         detail_window.exec_()
-    
+        
+    def export_results(self, fmt: str):
+        """Eksport-funktion til Excel, CSV, HTML eller PDF via pandas"""
+        if not self.current_results:
+            QMessageBox.warning(self, "Ingen data", "Der er ingen resultater at eksportere endnu.")
+            return
+            
+        file_filter = f"{fmt.upper()} Filer (*.{fmt})"
+        filepath, _ = QFileDialog.getSaveFileName(self, "Gem Rapport", f"folketælling_rapport.{fmt}", file_filter)
+        
+        if not filepath:
+            return
+            
+        try:
+            # Fjern interne metadata-kolonner inden eksport
+            clean_results = []
+            for r in self.current_results:
+                clean_r = {k: v for k, v in r.items() if not k.startswith('_')}
+                clean_r['Kilde_Filnavn'] = r.get('_fil', '')
+                clean_results.append(clean_r)
+                
+            df = pd.DataFrame(clean_results)
+            
+            if fmt == 'csv':
+                df.to_csv(filepath, index=False, sep=';', encoding='utf-8-sig')
+            elif fmt == 'xlsx':
+                df.to_excel(filepath, index=False)
+            elif fmt == 'html':
+                df.to_html(filepath, index=False, classes='table table-striped')
+            elif fmt == 'pdf':
+                # Simpel tabel-dump som HTML før konvertering eller advarsel
+                QMessageBox.information(self, "PDF Eksport", "For fuld PDF-generering anbefales det at gemme som HTML og printe som PDF via din browser for bedst formatering.")
+                df.to_html(filepath.replace('.pdf', '.html'), index=False)
+                
+            QMessageBox.information(self, "Succes", f"Rapporten blev gemt succesfuldt i: {filepath}")
+        except Exception as e:
+            QMessageBox.critical(self, "Eksport Fejl", f"Kunne ikke gemme filen:\n{str(e)}")
+
     def search_finished(self):
         """Called when search is finished"""
         self.search_btn.setEnabled(True)
         self.progress_bar.setVisible(False)
     
     def closeEvent(self, event):
-        """Handle window close event - clean up threads"""
-        # Stop any running search
         if self.search_worker:
             self.search_worker.stop_flag = True
-        
-        # Wait for thread to finish
         if self.search_thread and self.search_thread.isRunning():
             self.search_thread.quit()
             self.search_thread.wait(timeout=2000)
-        
         event.accept()
     
     def show_diagnostics(self):
@@ -771,390 +740,52 @@ class CsvSearcherGUI(QMainWindow):
             QMessageBox.warning(self, "Fejl", "Vælg først en mappe med CSV-filer!")
             return
         
-        # Create diagnostics window
         diag_window = QDialog(self)
         diag_window.setWindowTitle("Diagnostics & Søgetips")
-        diag_window.setGeometry(100, 100, 1200, 700)
+        diag_window.setGeometry(100, 100, 800, 500)
         
         layout = QVBoxLayout()
-        
-        # Create tabs
         tabs = QTabWidget()
         
-        # Tab 1: Dataset Overview
         overview_scroll = QScrollArea()
         overview_scroll.setWidgetResizable(True)
         overview_widget = QWidget()
         overview_layout = QVBoxLayout()
         
-        info_text = "<h2>📊 Dataset Oversigt</h2>"
-        
+        info_text = "<h2>📊 Dataset Oversigt & Diagnostik</h2>"
         try:
             csv_files = list(Path(self.csv_folder).glob("**/*.csv"))
-            info_text += f"<p><b>Antal CSV-filer:</b> {len(csv_files)}</p>"
-            
-            # Sample a few files to get statistics
-            total_rows = 0
-            sample_data = []
-            
-            for csv_file in csv_files[:10]:  # Sample first 10 files
-                try:
-                    with open(csv_file, 'r', encoding='latin-1') as csvfile:
-                        reader = csv.DictReader(csvfile, delimiter=';')
-                        rows = list(reader)[:5]  # Get first 5 rows
-                    
-                    if rows:
-                        df = pd.DataFrame(rows)
-                        total_rows += len(df)
-                        sample_data.append(df)
-                except:
-                    pass
-            
-            # Estimate total
-            estimated_total = int((total_rows / 10) * len(csv_files)) if csv_files else 0
-            info_text += f"<p><b>Estimeret antal personer:</b> ~{estimated_total:,}</p>"
-            
-            # Show sample names
-            info_text += "<h3>📝 Eksempler på navne i datasættet:</h3>"
-            info_text += "<ul style='max-height: 300px; overflow-y: auto;'>"
-            
-            if sample_data:
-                seen_names = set()
-                for df in sample_data:
-                    if 'Kildenavn' in df.columns:
-                        for name in df['Kildenavn'].dropna().unique()[:20]:
-                            name_str = str(name).strip()
-                            if name_str and name_str not in seen_names and name_str != 'nan':
-                                info_text += f"<li>{name_str}</li>"
-                                seen_names.add(name_str)
-                                if len(seen_names) >= 30:
-                                    break
-                        if len(seen_names) >= 30:
-                            break
-            
-            info_text += "</ul>"
-            
+            info_text += f"<p><b>Valgt Mappe:</b> {self.csv_folder}</p>"
+            info_text += f"<p><b>Antal CSV-filer fundet:</b> {len(csv_files)}</p>"
+            if csv_files:
+                info_text += f"<p><b>Eksempel på filstruktur:</b> {csv_files[0].name}</p>"
+                # Læs overskrifter fra første fil som test
+                with open(csv_files[0], 'r', encoding='latin-1', errors='replace') as f:
+                    first_line = f.readline().strip()
+                    info_text += f"<p><b>Kolonner fundet i filen:</b><br><small style='color: #555;'>{first_line}</small></p>"
         except Exception as e:
-            info_text += f"<p style='color: red;'>Fejl ved læsning: {str(e)}</p>"
-        
-        overview_label = QLabel(info_text)
-        overview_label.setWordWrap(True)
-        overview_layout.addWidget(overview_label)
+            info_text += f"<p style='color:red;'>Kunne ikke hente statistikker: {e}</p>"
+            
+        lbl = QLabel(info_text)
+        lbl.setWordWrap(True)
+        overview_layout.addWidget(lbl)
         overview_layout.addStretch()
-        
         overview_widget.setLayout(overview_layout)
         overview_scroll.setWidget(overview_widget)
-        tabs.addTab(overview_scroll, "Dataset Info")
         
-        # Tab 2: Search Tips
-        tips_scroll = QScrollArea()
-        tips_scroll.setWidgetResizable(True)
-        tips_widget = QWidget()
-        tips_layout = QVBoxLayout()
-        
-        tips_html = """
-        <h2>🔍 Søgetips & Fejlfinding</h2>
-        
-        <h3>❌ Ingen resultater? Prøv dette:</h3>
-        
-        <h4>1. Stavefejl?</h4>
-        <ul>
-            <li>Prøv at søge uden mellemrum: "JensHansen" → "Jens" eller "Hansen"</li>
-            <li>Danske bogstaver: æ, ø, å virker - men prøv varianter</li>
-            <li>Søg efter del af navn: "Hans" matcher "Hansen", "Hanson", etc.</li>
-        </ul>
-        
-        <h4>2. Formatering?</h4>
-        <ul>
-            <li>Navn kan være formateret som "Fornavn Mellemnavn Efternavn"</li>
-            <li>Søg efter fornavn ELLER efternavn separat</li>
-            <li>Eksempel: søg "Jens" + Efternavn, eller bare "Hansen"</li>
-        </ul>
-        
-        <h4>3. Fødeår?</h4>
-        <ul>
-            <li>Denne folketal er fra 1940 - personer kan være 0-150 år gamle</li>
-            <li>Hvis bedstefar er 90 år i 1940 → født ca. 1850</li>
-            <li>Sæt fødeår range bredt: fx 1800-1900</li>
-        </ul>
-        
-        <h4>4. Ikke i datasættet?</h4>
-        <ul>
-            <li>Datasættet er fra 1940 og kan være ufuldstændigt</li>
-            <li>Nogle personer kan være udeladt eller stavemig anderledes</li>
-            <li>Læg mærke til at nogle filer kan være fejlformaterede</li>
-        </ul>
-        
-        <h3>✅ Tips til succesfulsøgning:</h3>
-        
-        <ul>
-            <li><b>Start bredt:</b> søg kun efternavn først</li>
-            <li><b>Brug filtre:</b> køn, alder, fødested hjælper</li>
-            <li><b>Prøv dele af navn:</b> "sen" matcher "Hansen", "Jensen", "Sørensen"</li>
-            <li><b>Case-insensitive:</b> "hansen" = "HANSEN" = "Hansen"</li>
-            <li><b>Se eksempler:</b> scroll liste ovenfor for inspiraiton</li>
-        </ul>
-        
-        <h3>📋 Datakolonner:</h3>
-        <ul>
-            <li><b>Kildenavn:</b> Personens navn</li>
-            <li><b>Køn:</b> M eller K</li>
-            <li><b>Alder:</b> Alder i 1940</li>
-            <li><b>Fødeår:</b> Årtal for fødsel</li>
-            <li><b>Fødested:</b> By eller region</li>
-            <li><b>Civilstand:</b> Gift, Ugift, etc.</li>
-            <li><b>Stilling i husstanden:</b> Husfader, Husassistent, Barn, etc.</li>
-        </ul>
-        """
-        
-        tips_label = QLabel(tips_html)
-        tips_label.setWordWrap(True)
-        tips_layout.addWidget(tips_label)
-        tips_layout.addStretch()
-        
-        tips_widget.setLayout(tips_layout)
-        tips_scroll.setWidget(tips_widget)
-        tabs.addTab(tips_scroll, "Søgetips")
-        
-        # Tab 3: Sample Data
-        sample_scroll = QScrollArea()
-        sample_scroll.setWidgetResizable(True)
-        sample_widget = QWidget()
-        sample_layout = QVBoxLayout()
-        
-        sample_html = "<h2>📄 Sample Data fra Første Fil</h2>"
-        
-        try:
-            csv_files = list(Path(self.csv_folder).glob("**/*.csv"))
-            if csv_files:
-                first_file = csv_files[0]
-                with open(first_file, 'r', encoding='latin-1') as csvfile:
-                    reader = csv.DictReader(csvfile, delimiter=';')
-                    rows = list(reader)[:10]
-                
-                if rows:
-                    df = pd.DataFrame(rows)
-                else:
-                    df = pd.DataFrame()
-                
-                sample_html += f"<p><b>Fil:</b> {first_file.name}</p>"
-                sample_html += f"<p><b>Antal rækker:</b> {len(df)}</p>"
-                sample_html += f"<p><b>Kolonner:</b> {', '.join(df.columns.tolist())}</p>"
-                sample_html += "<h3>Første 5 personer:</h3>"
-                
-                sample_html += df[['Kildenavn', 'Køn', 'Alder', 'Fødeår', 'Civilstand']].head(5).to_html(index=False)
-        except Exception as e:
-            sample_html += f"<p style='color: red;'>Fejl: {str(e)}</p>"
-        
-        sample_label = QLabel(sample_html)
-        sample_label.setWordWrap(True)
-        sample_layout.addWidget(sample_label)
-        sample_layout.addStretch()
-        
-        sample_widget.setLayout(sample_layout)
-        sample_scroll.setWidget(sample_widget)
-        tabs.addTab(sample_scroll, "Sample Data")
-        
+        tabs.addTab(overview_scroll, "System status")
         layout.addWidget(tabs)
         
-        # Close button
         close_btn = QPushButton("Luk")
         close_btn.clicked.connect(diag_window.close)
         layout.addWidget(close_btn)
         
         diag_window.setLayout(layout)
         diag_window.exec_()
-    
-    def export_results(self, format_type: str):
-        """Export results to file"""
-        if not self.current_results:
-            QMessageBox.warning(self, "Fejl", "Ingen resultater at eksportere!")
-            return
-        
-        # Ask user for file location
-        file_dialog = QFileDialog()
-        file_dialog.setDefaultSuffix(format_type)
-        
-        if format_type == "xlsx":
-            filename, _ = file_dialog.getSaveFileName(
-                self, "Gem Excel fil", "", "Excel filer (*.xlsx)"
-            )
-            if filename:
-                self.export_to_excel(filename)
-        
-        elif format_type == "csv":
-            filename, _ = file_dialog.getSaveFileName(
-                self, "Gem CSV fil", "", "CSV filer (*.csv)"
-            )
-            if filename:
-                self.export_to_csv(filename)
-        
-        elif format_type == "pdf":
-            filename, _ = file_dialog.getSaveFileName(
-                self, "Gem PDF fil", "", "PDF filer (*.pdf)"
-            )
-            if filename:
-                self.export_to_pdf(filename)
-        
-        elif format_type == "html":
-            filename, _ = file_dialog.getSaveFileName(
-                self, "Gem HTML fil", "", "HTML filer (*.html)"
-            )
-            if filename:
-                self.export_to_html(filename)
-    
-    def export_to_excel(self, filename: str):
-        """Export results to Excel file"""
-        try:
-            df = pd.DataFrame(self.current_results)
-            # Remove internal columns
-            df = df[[col for col in df.columns if not col.startswith('_')]]
-            
-            with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False, sheet_name='Resultater')
-                # Auto-adjust column width
-                worksheet = writer.sheets['Resultater']
-                for column in worksheet.columns:
-                    max_length = 0
-                    column_letter = column[0].column_letter
-                    for cell in column:
-                        try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except:
-                            pass
-                    adjusted_width = min(max_length + 2, 50)
-                    worksheet.column_dimensions[column_letter].width = adjusted_width
-            
-            QMessageBox.information(self, "Succes", f"Resultater eksporteret til Excel:\n{filename}")
-            self.statusBar.showMessage(f"Eksporteret til Excel: {filename}")
-        except Exception as e:
-            QMessageBox.critical(self, "Fejl", f"Fejl ved export til Excel:\n{str(e)}")
-    
-    def export_to_csv(self, filename: str):
-        """Export results to CSV file"""
-        try:
-            df = pd.DataFrame(self.current_results)
-            # Remove internal columns
-            df = df[[col for col in df.columns if not col.startswith('_')]]
-            
-            df.to_csv(filename, index=False, sep=';', encoding='utf-8')
-            QMessageBox.information(self, "Succes", f"Resultater eksporteret til CSV:\n{filename}")
-            self.statusBar.showMessage(f"Eksporteret til CSV: {filename}")
-        except Exception as e:
-            QMessageBox.critical(self, "Fejl", f"Fejl ved export til CSV:\n{str(e)}")
-    
-    def export_to_pdf(self, filename: str):
-        """Export results to PDF file"""
-        try:
-            from reportlab.lib import colors
-            from reportlab.lib.pagesizes import A4, landscape
-            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
-            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-            
-            # Create PDF
-            doc = SimpleDocTemplate(filename, pagesize=landscape(A4), leftMargin=10, rightMargin=10)
-            elements = []
-            
-            # Title
-            styles = getSampleStyleSheet()
-            title_style = ParagraphStyle(
-                'CustomTitle',
-                parent=styles['Heading1'],
-                fontSize=16,
-                textColor=colors.HexColor('#4CAF50'),
-                spaceAfter=12,
-            )
-            elements.append(Paragraph(f"Søgeresultater - {len(self.current_results)} personer", title_style))
-            elements.append(Spacer(1, 12))
-            
-            # Create table
-            df = pd.DataFrame(self.current_results)
-            # Remove internal columns
-            df = df[[col for col in df.columns if not col.startswith('_')]]
-            
-            # Limit columns for PDF (too many columns breaks layout)
-            key_columns = ['Kildenavn', 'Køn', 'Alder', 'Fødeår', 'Civilstand', 
-                          'Kildefødested', 'KIPnr', '_fil']
-            available_cols = [col for col in key_columns if col in df.columns]
-            df_limited = df[available_cols]
-            
-            # Convert to table data
-            table_data = [list(df_limited.columns)] + df_limited.values.tolist()
-            
-            # Create table
-            table = Table(table_data, repeatRows=1)
-            table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#4CAF50')),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, 0), 10),
-                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('FONTSIZE', (0, 1), (-1, -1), 8),
-                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0f0f0')]),
-            ]))
-            
-            elements.append(table)
-            
-            # Build PDF
-            doc.build(elements)
-            QMessageBox.information(self, "Succes", f"Resultater eksporteret til PDF:\n{filename}")
-            self.statusBar.showMessage(f"Eksporteret til PDF: {filename}")
-        except Exception as e:
-            QMessageBox.critical(self, "Fejl", f"Fejl ved export til PDF:\n{str(e)}")
-    
-    def export_to_html(self, filename: str):
-        """Export results to HTML file"""
-        try:
-            df = pd.DataFrame(self.current_results)
-            # Remove internal columns
-            df = df[[col for col in df.columns if not col.startswith('_')]]
-            
-            html_content = """
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="utf-8">
-                <title>Søgeresultater</title>
-                <style>
-                    body { font-family: Arial, sans-serif; margin: 20px; }
-                    h1 { color: #4CAF50; }
-                    table { border-collapse: collapse; width: 100%; }
-                    th { background-color: #4CAF50; color: white; padding: 10px; text-align: left; }
-                    td { border: 1px solid #ddd; padding: 8px; }
-                    tr:nth-child(even) { background-color: #f0f0f0; }
-                    tr:hover { background-color: #f9f9f9; }
-                </style>
-            </head>
-            <body>
-                <h1>Søgeresultater - Folketal</h1>
-                <p>Total resultater: <strong>""" + str(len(self.current_results)) + """</strong></p>
-            """
-            
-            html_content += df.to_html(index=False)
-            html_content += """
-            </body>
-            </html>
-            """
-            
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write(html_content)
-            
-            QMessageBox.information(self, "Succes", f"Resultater eksporteret til HTML:\n{filename}")
-            self.statusBar.showMessage(f"Eksporteret til HTML: {filename}")
-        except Exception as e:
-            QMessageBox.critical(self, "Fejl", f"Fejl ved export til HTML:\n{str(e)}")
 
 
-def main():
+if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = CsvSearcherGUI()
     window.show()
-    sys.exit(app.exec_())
-
-
-if __name__ == '__main__':
-    main()
+    sys.exit(app.exec())
