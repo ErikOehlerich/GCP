@@ -715,6 +715,188 @@ class PeriodScanWorker(QObject):
             self.finished.emit()
 
 
+class SurnameVariantScanWorker(QObject):
+    """Background worker for surname-variant scanning in a specific year folder."""
+    progress = pyqtSignal(int)
+    status_update = pyqtSignal(str)
+    result_ready = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, scan_folder: str, query: str, scan_label: str):
+        super().__init__()
+        self.scan_folder = Path(scan_folder)
+        self.query = query.strip()
+        self.scan_label = scan_label
+        self.stop_flag = False
+
+    def stop(self):
+        self.stop_flag = True
+
+    @staticmethod
+    def extract_tokens(name_value: str) -> List[str]:
+        cleaned = re.sub(r"[^\w\s\-ÆØÅæøåÄÖÜäöüß]", " ", str(name_value))
+        tokens = [token.strip("-") for token in cleaned.split() if token.strip("-")]
+        return [token for token in tokens if len(token) >= 3]
+
+    @staticmethod
+    def surname_token(full_name: str) -> str:
+        tokens = SurnameVariantScanWorker.extract_tokens(full_name)
+        return tokens[-1] if tokens else ''
+
+    @staticmethod
+    def similarity_score(query: str, token: str) -> float:
+        query_exact_norm = SearchWorker.normalize_text(query)
+        query_norm = SearchWorker.flatten_search_text(query)
+        token_exact = SearchWorker.normalize_text(token)
+        token_norm = SearchWorker.flatten_search_text(token)
+
+        if not query_norm or not token_norm:
+            return 0.0
+
+        if query_exact_norm and (query_exact_norm in token_exact or token_exact in query_exact_norm):
+            score = 1.0
+        else:
+            score = SequenceMatcher(None, query_norm, token_norm).ratio()
+
+        if token_norm[0] == query_norm[0]:
+            score += 0.03
+
+        return min(1.0, score)
+
+    def build_report(self, variants: List[Dict], csv_count: int, rows_scanned: int, matches: int) -> str:
+        lines = []
+        lines.append(f"Efternavn-variantscan for {self.scan_label}: '{self.query}'")
+        lines.append(f"Scanmappe: {self.scan_folder}")
+        lines.append(f"Scannede filer: {csv_count}")
+        lines.append(f"Scannede navnerækker: {rows_scanned}")
+        lines.append(f"Rækker med faktisk efternavnsmatch: {matches}")
+        lines.append(f"Unikke varianter: {len(variants)}")
+        lines.append("")
+
+        if not variants:
+            lines.append(f"Ingen efternavn-varianter fundet i {self.scan_label}.")
+            lines.append(f"Det tyder på, at navnet ikke er registreret i {self.scan_label}-datasættet under en tæt stavemåde.")
+            return "\n".join(lines)
+
+        lines.append("Top varianter:")
+        for idx, entry in enumerate(variants[:50], start=1):
+            examples = '; '.join(sorted(entry['examples']))
+            files = ', '.join(sorted(entry['files']))
+            lines.append(
+                f"{idx:2d}. {entry['display']} | score={entry['best_score']:.2f} | "
+                f"antal={entry['count']} | filer={files}"
+            )
+            if examples:
+                lines.append(f"    Eksempler: {examples}")
+
+        top_score = variants[0]['best_score']
+        if top_score < 0.80:
+            lines.append("")
+            lines.append(
+                "Bemærk: de bedste kandidater ligger langt fra det søgte efternavn, "
+                f"så et ægte {self.query}-hit ser ikke ud til at eksistere i {self.scan_label}."
+            )
+
+        return "\n".join(lines)
+
+    def run(self):
+        try:
+            if not self.scan_folder.exists() or not self.scan_folder.is_dir():
+                self.result_ready.emit(f"Ugyldig scanningsmappe for {self.scan_label}: {self.scan_folder}")
+                return
+
+            csv_files = sorted(self.scan_folder.glob('**/*.csv'))
+            if not csv_files:
+                self.result_ready.emit(f"Ingen CSV-filer fundet under: {self.scan_folder}")
+                return
+
+            if not self.query:
+                self.result_ready.emit("Skriv et efternavn først i feltet 'Efternavn'.")
+                return
+
+            threshold = 0.80
+            variants: Dict[str, Dict] = {}
+            rows_scanned = 0
+            matches = 0
+
+            self.status_update.emit(f"Scanner navnevarianter i {self.scan_label} ({len(csv_files)} filer)...")
+
+            for file_index, csv_file in enumerate(csv_files, start=1):
+                if self.stop_flag:
+                    self.status_update.emit(f"Variantscan for {self.scan_label} annulleret.")
+                    break
+
+                try:
+                    with open(csv_file, 'r', encoding='latin-1', errors='replace') as csvfile:
+                        reader = csv.DictReader(csvfile, delimiter=';')
+                        if not reader.fieldnames:
+                            continue
+
+                        name_column = 'Kildenavn'
+                        if name_column not in reader.fieldnames:
+                            matching_name_cols = [col for col in reader.fieldnames if SearchWorker.normalize_key(col) == 'kildenavn']
+                            if matching_name_cols:
+                                name_column = matching_name_cols[0]
+                            else:
+                                continue
+
+                        for row in reader:
+                            if self.stop_flag:
+                                break
+
+                            full_name = str(row.get(name_column, '')).strip()
+                            if not full_name:
+                                continue
+
+                            rows_scanned += 1
+                            surname = self.surname_token(full_name)
+                            if not surname:
+                                continue
+
+                            score = self.similarity_score(self.query, surname)
+                            if score < threshold:
+                                continue
+
+                            matches += 1
+                            token_key = SearchWorker.flatten_search_text(surname)
+                            if token_key not in variants:
+                                variants[token_key] = {
+                                    'display': surname,
+                                    'count': 0,
+                                    'best_score': 0.0,
+                                    'examples': set(),
+                                    'files': set(),
+                                }
+
+                            entry = variants[token_key]
+                            entry['count'] += 1
+                            entry['best_score'] = max(entry['best_score'], score)
+                            if len(entry['examples']) < 5:
+                                entry['examples'].add(full_name)
+                            if len(entry['files']) < 5:
+                                entry['files'].add(csv_file.name)
+                except Exception:
+                    continue
+
+                if file_index % 100 == 0:
+                    self.status_update.emit(f"Variantscan for {self.scan_label}: {file_index}/{len(csv_files)} filer...")
+                    self.progress.emit(int((file_index / len(csv_files)) * 100))
+
+            ranked = sorted(
+                variants.values(),
+                key=lambda item: (item['best_score'], item['count']),
+                reverse=True,
+            )
+
+            self.result_ready.emit(self.build_report(ranked, len(csv_files), rows_scanned, matches))
+            self.status_update.emit(f"Efternavn-variantscan for {self.scan_label} færdig.")
+
+        except Exception as exc:
+            self.result_ready.emit(f"Fejl under efternavn-variantscan for {self.scan_label}: {exc}")
+        finally:
+            self.finished.emit()
+
+
 class CsvSearcherGUI(QMainWindow):
     """Main GUI window for CSV searcher"""
     
@@ -728,6 +910,11 @@ class CsvSearcherGUI(QMainWindow):
         self.search_worker = None
         self.period_scan_thread = None
         self.period_scan_worker = None
+        self.surname_variant_thread = None
+        self.surname_variant_worker = None
+        self.surname_variant_dialog = None
+        self.surname_variant_progress = None
+        self.surname_variant_text_box = None
         self.current_results = []
         self.all_columns = []  # Dynamiske kolonner fra CSV-filer
         
@@ -843,10 +1030,10 @@ class CsvSearcherGUI(QMainWindow):
         debug_btn.setStyleSheet("background-color: #2196F3; color: white; padding: 10px;")
         main_layout.addWidget(debug_btn)
 
-        variant_btn = QPushButton("🔎 Find efternavn-varianter (1940)")
-        variant_btn.clicked.connect(self.find_surname_variants_1940)
-        variant_btn.setStyleSheet("background-color: #607D8B; color: white; padding: 10px;")
-        main_layout.addWidget(variant_btn)
+        self.variant_btn = QPushButton("🔎 Find efternavn-varianter")
+        self.variant_btn.clicked.connect(self.find_surname_variants)
+        self.variant_btn.setStyleSheet("background-color: #607D8B; color: white; padding: 10px;")
+        main_layout.addWidget(self.variant_btn)
         
         # File browser button
         file_btn = QPushButton("📁 Se Filer")
@@ -929,12 +1116,12 @@ class CsvSearcherGUI(QMainWindow):
         columns = set()
         try:
             csv_files = list(Path(self.csv_folder).glob("**/*.csv"))
-            for csv_file in csv_files[:20]:  # Sample first 20 files
+            helper = SearchWorker(self.csv_folder, {})
+            for csv_file in csv_files:
                 try:
-                    with open(csv_file, 'r', encoding='latin-1', errors='replace') as f:
-                        reader = csv.DictReader(f, delimiter=';')
-                        if reader.fieldnames:
-                            columns.update([col.strip() for col in reader.fieldnames])
+                    df = helper.load_csv_dataframe(csv_file)
+                    if df is not None and not df.empty:
+                        columns.update([str(col).strip() for col in df.columns if str(col).strip()])
                 except:
                     pass
         except:
@@ -1097,7 +1284,7 @@ class CsvSearcherGUI(QMainWindow):
             filtered_files = [f for f in csv_files if search_text.lower() in f.name.lower()] if search_text else csv_files
             file_table.setRowCount(len(filtered_files))
             
-            files_with_results = set([r.get('_fil', '') for r in self.current_results])
+            files_with_results = set([r.get('_fulsti', '') for r in self.current_results])
             
             for row, file_path in enumerate(filtered_files):
                 file_table.setItem(row, 0, QTableWidgetItem(file_path.name))
@@ -1109,7 +1296,7 @@ class CsvSearcherGUI(QMainWindow):
                 except:
                     file_table.setItem(row, 2, QTableWidgetItem("N/A"))
                 
-                if file_path.name in files_with_results:
+                if str(file_path) in files_with_results:
                     status_item = QTableWidgetItem("✓ Resultater")
                     status_item.setBackground(QColor("#c8e6c9"))
                     file_table.setItem(row, 3, status_item)
@@ -1474,20 +1661,50 @@ class CsvSearcherGUI(QMainWindow):
             item = QTableWidgetItem(value)
             self.results_table.setItem(row, col_idx, item)
 
-    def find_surname_variants_1940(self):
-        """Scan 1940 data and find likely surname variants for current last-name query."""
+    def find_surname_variants(self):
+        """Scan a selected year and find likely surname variants for current last-name query."""
         query = self.efternavn_input.text().strip()
         if not query:
             QMessageBox.warning(self, "Mangler efternavn", "Skriv et efternavn først i feltet 'Efternavn'.")
             return
 
-        root_folder, _ = self.get_period_root_and_years()
-        year_folder = root_folder / '1940'
+        root_folder, available_years = self.get_period_root_and_years()
+        if not available_years:
+            QMessageBox.warning(self, "Ingen årgange", f"Ingen årsmappper fundet under: {root_folder}")
+            return
+
+        year_dialog = QDialog(self)
+        year_dialog.setWindowTitle("Vælg årgang")
+        year_layout = QVBoxLayout()
+        year_layout.addWidget(QLabel("Vælg hvilken årgang der skal scannes for efternavn-varianter."))
+
+        year_spin = QSpinBox()
+        year_spin.setRange(min(available_years), max(available_years))
+        year_spin.setValue(1940 if 1940 in available_years else max(available_years))
+        year_layout.addWidget(year_spin)
+
+        button_row = QHBoxLayout()
+        ok_btn = QPushButton("OK")
+        cancel_btn = QPushButton("Annuller")
+        button_row.addWidget(ok_btn)
+        button_row.addWidget(cancel_btn)
+        year_layout.addLayout(button_row)
+
+        year_dialog.setLayout(year_layout)
+
+        ok_btn.clicked.connect(year_dialog.accept)
+        cancel_btn.clicked.connect(year_dialog.reject)
+
+        if year_dialog.exec_() != QDialog.Accepted:
+            return
+
+        selected_year = year_spin.value()
+        year_folder = root_folder / str(selected_year)
         if not year_folder.exists():
             QMessageBox.warning(
                 self,
-                "1940 ikke fundet",
-                f"Kunne ikke finde årsmappen 1940 under: {root_folder}"
+                f"{selected_year} ikke fundet",
+                f"Kunne ikke finde årsmappen {selected_year} under: {root_folder}"
             )
             return
 
@@ -1495,162 +1712,91 @@ class CsvSearcherGUI(QMainWindow):
         if not scan_folder.exists():
             scan_folder = year_folder
 
-        csv_files = sorted(scan_folder.glob('**/*.csv'))
-        if not csv_files:
+        if self.surname_variant_thread and self.surname_variant_thread.isRunning():
+            QMessageBox.information(self, "Kører allerede", "Der kører allerede en efternavn-variantscan.")
+            return
+
+        if not scan_folder.exists():
             QMessageBox.warning(self, "Ingen filer", f"Ingen CSV-filer fundet under: {scan_folder}")
             return
 
-        query_norm = SearchWorker.flatten_search_text(query)
-        query_exact_norm = SearchWorker.normalize_text(query)
-
-        def extract_tokens(name_value: str) -> List[str]:
-            cleaned = re.sub(r"[^\w\s\-ÆØÅæøåÄÖÜäöüß]", " ", str(name_value))
-            tokens = [token.strip("-") for token in cleaned.split() if token.strip("-")]
-            return [token for token in tokens if len(token) >= 3]
-
-        def similarity_score(token: str) -> float:
-            token_exact = SearchWorker.normalize_text(token)
-            token_norm = SearchWorker.flatten_search_text(token)
-            if not token_norm or len(token_norm) < 3:
-                return 0.0
-
-            if query_exact_norm and (query_exact_norm in token_exact or token_exact in query_exact_norm):
-                return 1.0
-            else:
-                score = SequenceMatcher(None, query_norm, token_norm).ratio()
-
-            if token_norm and query_norm and token_norm[0] == query_norm[0]:
-                score += 0.03
-
-            return min(1.0, score)
-
-        variants: Dict[str, Dict] = {}
-        names_scanned = 0
-        row_hits = 0
-
-        self.statusBar.showMessage(f"Scanner 1940-navnevarianter i {len(csv_files)} filer...")
-
-        for file_index, csv_file in enumerate(csv_files, start=1):
-            try:
-                with open(csv_file, 'r', encoding='latin-1', errors='replace') as csvfile:
-                    reader = csv.DictReader(csvfile, delimiter=';')
-                    if not reader.fieldnames:
-                        continue
-
-                    name_column = 'Kildenavn'
-                    if name_column not in reader.fieldnames:
-                        matching_name_cols = [col for col in reader.fieldnames if SearchWorker.normalize_key(col) == 'kildenavn']
-                        if matching_name_cols:
-                            name_column = matching_name_cols[0]
-                        else:
-                            continue
-
-                    for row in reader:
-                        full_name = str(row.get(name_column, '')).strip()
-                        if not full_name:
-                            continue
-
-                        names_scanned += 1
-                        tokens = extract_tokens(full_name)
-                        if not tokens:
-                            continue
-
-                        best_token = None
-                        best_score = 0.0
-                        for token in tokens:
-                            score = similarity_score(token)
-                            if score > best_score:
-                                best_score = score
-                                best_token = token
-
-                        if not best_token:
-                            continue
-
-                        row_hits += 1
-                        token_key = SearchWorker.flatten_search_text(best_token)
-                        if token_key not in variants:
-                            variants[token_key] = {
-                                'display': best_token,
-                                'count': 0,
-                                'best_score': 0.0,
-                                'examples': set(),
-                                'files': set(),
-                            }
-
-                        entry = variants[token_key]
-                        entry['count'] += 1
-                        entry['best_score'] = max(entry['best_score'], best_score)
-                        if len(entry['examples']) < 5:
-                            entry['examples'].add(full_name)
-                        if len(entry['files']) < 5:
-                            entry['files'].add(csv_file.name)
-            except Exception:
-                continue
-
-            if file_index % 100 == 0:
-                self.statusBar.showMessage(
-                    f"Scanner 1940-navnevarianter: {file_index}/{len(csv_files)} filer..."
-                )
-                QApplication.processEvents()
-
-        ranked = sorted(
-            variants.values(),
-            key=lambda item: (item['best_score'], item['count']),
-            reverse=True,
-        )
-
-        report_lines = []
-        report_lines.append(f"Efternavn-variantscan for 1940: '{query}'")
-        report_lines.append(f"Scanmappe: {scan_folder}")
-        report_lines.append(f"Scannede filer: {len(csv_files)}")
-        report_lines.append(f"Scannede navnerækker: {names_scanned}")
-        report_lines.append(f"Rækker med variantmatch: {row_hits}")
-        report_lines.append(f"Unikke varianter: {len(ranked)}")
-        report_lines.append("")
-
-        if not ranked:
-            report_lines.append("Ingen efternavn-varianter fundet i 1940.")
-            report_lines.append("Det tyder på, at navnet ikke er registreret i 1940-datasættet under en tæt stavemåde.")
-        else:
-            report_lines.append("Top varianter:")
-            for idx, entry in enumerate(ranked[:50], start=1):
-                examples = '; '.join(sorted(entry['examples']))
-                files = ', '.join(sorted(entry['files']))
-                report_lines.append(
-                    f"{idx:2d}. {entry['display']} | score={entry['best_score']:.2f} | "
-                    f"antal={entry['count']} | filer={files}"
-                )
-                if examples:
-                    report_lines.append(f"    Eksempler: {examples}")
-
-            top_score = ranked[0]['best_score']
-            if top_score < 0.80:
-                report_lines.append("")
-                report_lines.append(
-                    "Bemærk: de bedste kandidater ligger langt fra det søgte efternavn, "
-                    "så et ægte Oehlerich-hit ser ikke ud til at eksistere i 1940." 
-                )
-
-        report_text = "\n".join(report_lines)
-
-        result_dialog = QDialog(self)
-        result_dialog.setWindowTitle("Efternavn-varianter i 1940")
-        result_dialog.setGeometry(120, 120, 1000, 700)
+        self.surname_variant_dialog = QDialog(self)
+        self.surname_variant_dialog.setWindowTitle(f"Efternavn-varianter i {selected_year}")
+        self.surname_variant_dialog.setGeometry(120, 120, 1000, 700)
         dialog_layout = QVBoxLayout()
 
-        text_box = QPlainTextEdit()
-        text_box.setReadOnly(True)
-        text_box.setPlainText(report_text)
-        dialog_layout.addWidget(text_box)
+        self.surname_variant_progress = QProgressBar()
+        self.surname_variant_progress.setRange(0, 100)
+        self.surname_variant_progress.setValue(0)
+        dialog_layout.addWidget(self.surname_variant_progress)
+
+        self.surname_variant_text_box = QPlainTextEdit()
+        self.surname_variant_text_box.setReadOnly(True)
+        self.surname_variant_text_box.setPlainText(f"Scanner {selected_year}-data i baggrunden...")
+        dialog_layout.addWidget(self.surname_variant_text_box)
 
         close_btn = QPushButton("Luk")
-        close_btn.clicked.connect(result_dialog.close)
+        close_btn.clicked.connect(self.surname_variant_dialog.close)
         dialog_layout.addWidget(close_btn)
 
-        result_dialog.setLayout(dialog_layout)
-        result_dialog.exec_()
+        self.surname_variant_dialog.setLayout(dialog_layout)
+        self.surname_variant_dialog.show()
 
-        self.statusBar.showMessage("1940 efternavn-variantscan færdig.")
+        self.surname_variant_thread = QThread(self)
+        self.surname_variant_worker = SurnameVariantScanWorker(str(scan_folder), query, str(selected_year))
+        self.surname_variant_worker.moveToThread(self.surname_variant_thread)
+
+        def safe_set_text(widget, text: str):
+            try:
+                widget.setPlainText(text)
+            except RuntimeError:
+                pass
+
+        def safe_set_value(widget, value: int):
+            try:
+                widget.setValue(value)
+            except RuntimeError:
+                pass
+
+        self.surname_variant_thread.started.connect(self.surname_variant_worker.run)
+        self.surname_variant_worker.progress.connect(lambda value: safe_set_value(self.surname_variant_progress, value))
+        self.surname_variant_worker.status_update.connect(self.statusBar.showMessage)
+        self.surname_variant_worker.result_ready.connect(lambda text: safe_set_text(self.surname_variant_text_box, text))
+
+        def on_variant_finished():
+            try:
+                self.variant_btn.setEnabled(True)
+            except RuntimeError:
+                pass
+
+            if self.surname_variant_progress:
+                safe_set_value(self.surname_variant_progress, 100)
+
+            if self.surname_variant_thread and self.surname_variant_thread.isRunning():
+                self.surname_variant_thread.quit()
+
+        def on_variant_thread_finished():
+            self.surname_variant_thread = None
+            self.surname_variant_worker = None
+
+        self.surname_variant_worker.finished.connect(on_variant_finished)
+        self.surname_variant_thread.finished.connect(on_variant_thread_finished)
+
+        self.variant_btn.setEnabled(False)
+        self.surname_variant_thread.start()
+
+        self.statusBar.showMessage(f"Efternavn-variantscan for {selected_year} startet i baggrunden.")
+
+    def find_surname_variants_1940(self):
+        """Backward-compatible wrapper for the 1940 variantscan."""
+        self.efternavn_input.setFocus()
+        root_folder, available_years = self.get_period_root_and_years()
+        if 1940 not in available_years:
+            self.find_surname_variants()
+            return
+
+        # Reuse the generic scanner, which defaults to 1940 when available.
+        self.find_surname_variants()
 
     def get_period_root_and_years(self) -> Tuple[Path, List[int]]:
         """Find the closest ancestor folder that contains year folders like 1901, 1930, 1940."""
@@ -1774,6 +1920,11 @@ class CsvSearcherGUI(QMainWindow):
         if self.period_scan_thread and self.period_scan_thread.isRunning():
             self.period_scan_thread.quit()
             self.period_scan_thread.wait(2000)
+        if self.surname_variant_worker:
+            self.surname_variant_worker.stop()
+        if self.surname_variant_thread and self.surname_variant_thread.isRunning():
+            self.surname_variant_thread.quit()
+            self.surname_variant_thread.wait(2000)
         event.accept()
     
     def show_diagnostics(self):
