@@ -24,19 +24,26 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread, QUrl
 from PyQt5.QtGui import QFont, QColor
-from PyQt5.QtWebEngineWidgets import QWebEngineView
 
 try:
-    import folium
+    from PyQt5.QtWebEngineWidgets import QWebEngineView  # type: ignore
+    HAS_WEBENGINE = True
+except ImportError:
+    HAS_WEBENGINE = False
+    QWebEngineView = None
+
+try:
+    import folium # type: ignore
     HAS_FOLIUM = True
 except ImportError:
     HAS_FOLIUM = False
 
 try:
-    from geopy.geocoders import Nominatim
+    from geopy.geocoders import Nominatim  # type: ignore
     HAS_GEOPY = True
 except ImportError:
     HAS_GEOPY = False
+    Nominatim = None
 
 
 class SearchWorker(QObject):

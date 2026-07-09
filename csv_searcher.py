@@ -7,10 +7,16 @@ import os
 import sys
 import csv
 import json
+import re
+import unicodedata
+import warnings
+import hashlib
+from difflib import SequenceMatcher
 import pandas as pd
+from pandas.errors import ParserWarning
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 import threading
 from queue import Queue
 import time
@@ -19,7 +25,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QLineEdit, QPushButton, QTableWidget, QTableWidgetItem, QLabel,
     QComboBox, QSpinBox, QFileDialog, QProgressBar, QStatusBar,
-    QCheckBox, QMessageBox, QTabWidget, QDialog, QScrollArea
+    QCheckBox, QMessageBox, QTabWidget, QDialog, QScrollArea, QPlainTextEdit
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QObject, QThread
 from PyQt5.QtGui import QFont, QColor
@@ -31,6 +37,48 @@ class SearchWorker(QObject):
     results = pyqtSignal(list)
     finished = pyqtSignal()
     status_update = pyqtSignal(str)
+
+    COLUMN_ALIASES = {
+        'Kildenavn': [
+            'kildenavn', 'navn', 'personnavn', 'fuldenavn', 'name'
+        ],
+        'Fornavn': [
+            'fornavn', 'first name', 'firstname', 'givenname', 'givennavn'
+        ],
+        'Efternavn': [
+            'efternavn', 'surname', 'lastname', 'last name', 'familyname', 'slægtsnavn'
+        ],
+        'Køn': [
+            'køn', 'kon', 'sex', 'gender'
+        ],
+        'Alder': [
+            'alder', 'age', 'kildealder'
+        ],
+        'Civilstand': [
+            'civilstand', 'civil status', 'stand', 'maritalstatus'
+        ],
+        'Fødeår': [
+            'fødeår', 'fodear', 'fødselsår', 'fodselsar', 'birthyear'
+        ],
+        'Kildefødested': [
+            'kildefødested', 'fødested', 'fodested', 'birthplace', 'fødestednavn'
+        ],
+        'Husstands/familienr.': [
+            'husstandsfamilienr', 'husstandsfamilienr', 'husstandnr', 'familienr', 'husstand'
+        ],
+        'Stilling_i_husstanden': [
+            'stillingihusstanden', 'stilling i husstanden', 'rolleihusstanden', 'role'
+        ],
+        'Kildeerhverv': [
+            'kildeerhverv', 'erhverv', 'occupation', 'job'
+        ],
+        'Kildestednavn': [
+            'kildestednavn', 'stednavn', 'lokation', 'location'
+        ],
+        'Født kildedato': [
+            'fødtkildedato', 'fodtkildedato', 'fødselsdato', 'fodselsdato', 'birthdate'
+        ],
+    }
     
     def __init__(self, csv_folder: str, search_params: Dict):
         super().__init__()
@@ -101,15 +149,15 @@ class SearchWorker(QObject):
         results = []
         
         try:
-            with open(csv_file, 'r', encoding='latin-1', errors='replace') as csvfile:
-                reader = csv.DictReader(csvfile, delimiter=';')
-                rows = list(reader)
-            
-            if not rows:
+            df = self.load_csv_dataframe(csv_file)
+
+            if df is None or df.empty:
                 return results
-            
-            df = pd.DataFrame(rows)
-            df.columns = df.columns.str.strip()
+
+            # Normaliser kolonnenavne og fjern evt. BOM i første kolonne.
+            df.columns = df.columns.astype(str).str.replace('\ufeff', '', regex=False).str.strip()
+            df = self.canonicalize_columns(df)
+            rows = df.to_dict('records')
             
             filtered_df = self.apply_filters(df)
             
@@ -128,6 +176,267 @@ class SearchWorker(QObject):
             print(f"Fejl ved læsning af {csv_file.name}: {e}")
         
         return results
+
+    def load_csv_dataframe(self, csv_file: Path) -> Optional[pd.DataFrame]:
+        """Load CSV robustly and preserve correct column/value alignment."""
+        encodings = ['utf-8-sig', 'latin-1', 'cp1252']
+        separators = [';', ',', '\t', '|']
+
+        best_df = None
+        best_score = -1
+
+        for encoding in encodings:
+            for sep in separators:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('ignore', ParserWarning)
+                        df = pd.read_csv(
+                            csv_file,
+                            sep=sep,
+                            dtype=str,
+                            keep_default_na=False,
+                            encoding=encoding,
+                            engine='python',
+                            index_col=False,
+                            on_bad_lines='skip'
+                        )
+
+                    if df is None or df.empty:
+                        continue
+
+                    # Normaliser kolonnenavne tidligt så vi kan score på reelle nøglefelter.
+                    df.columns = df.columns.astype(str).str.replace('\ufeff', '', regex=False).str.strip()
+                    df = self.canonicalize_columns(df)
+
+                    # Heuristik: foretræk parse med flest kolonner, færrest unnamed-felter,
+                    # og især at nøglekolonner faktisk indeholder data.
+                    col_count = len(df.columns)
+                    unnamed_count = sum(str(c).lower().startswith('unnamed:') for c in df.columns)
+                    score = (col_count * 10) - unnamed_count
+
+                    key_columns = ['Kildenavn', 'Fornavn', 'Efternavn', 'Kildefødested', 'Født kildedato', 'Fødeår']
+                    for key_column in key_columns:
+                        if key_column in df.columns:
+                            non_empty_count = int(df[key_column].fillna('').astype(str).str.strip().ne('').sum())
+                            score += min(non_empty_count, 100)
+
+                    if 'Kildenavn' in df.columns:
+                        sample_names = df['Kildenavn'].fillna('').astype(str).str.strip().head(50)
+                        if sample_names.ne('').any():
+                            score += 500
+
+                    if score > best_score:
+                        best_score = score
+                        best_df = df
+                except Exception:
+                    continue
+
+        if best_df is not None:
+            return best_df
+
+        # Sidste fallback: auto-detektion i pandas.
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', ParserWarning)
+                return pd.read_csv(
+                    csv_file,
+                    sep=None,
+                    dtype=str,
+                    keep_default_na=False,
+                    encoding='latin-1',
+                    engine='python',
+                    index_col=False,
+                    on_bad_lines='skip'
+                )
+        except Exception:
+            return None
+
+    def detect_delimiter(self, sample: str) -> str:
+        """Detect CSV delimiter with sensible fallback."""
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=';,\t|')
+            return dialect.delimiter
+        except Exception:
+            # Fald tilbage til semikolon som default for danske eksportfiler.
+            return ';'
+
+    @staticmethod
+    def normalize_key(text: str) -> str:
+        """Normalize text so differently formatted headers can be matched."""
+        normalized = unicodedata.normalize('NFKD', str(text))
+        normalized = ''.join(ch for ch in normalized if not unicodedata.combining(ch))
+        normalized = normalized.lower()
+        normalized = normalized.replace('ø', 'o').replace('å', 'a').replace('æ', 'ae')
+        normalized = re.sub(r'[^a-z0-9]+', '', normalized)
+        return normalized
+
+    def canonicalize_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Rename known variant headers to canonical names used by filters/UI."""
+        if df.empty:
+            return df
+
+        normalized_alias_lookup = {}
+        for canonical_name, aliases in self.COLUMN_ALIASES.items():
+            for alias in aliases:
+                normalized_alias_lookup[self.normalize_key(alias)] = canonical_name
+
+        rename_map = {}
+        used_canonical_names = set()
+        for original_col in df.columns:
+            normalized_col = self.normalize_key(original_col)
+            matched_canonical = normalized_alias_lookup.get(normalized_col)
+
+            if matched_canonical and matched_canonical not in used_canonical_names:
+                rename_map[original_col] = matched_canonical
+                used_canonical_names.add(matched_canonical)
+
+        if rename_map:
+            df = df.rename(columns=rename_map)
+
+        return df
+
+    @staticmethod
+    def normalize_text(value: str) -> str:
+        """Normalize searchable text while preserving letters for user-facing matching."""
+        normalized = unicodedata.normalize('NFKC', str(value))
+        normalized = ' '.join(normalized.split())
+        return normalized.casefold()
+
+    @staticmethod
+    def transliterate_search_text(value: str) -> str:
+        """Convert Nordic and German letters to a shared ASCII-like search form."""
+        normalized = SearchWorker.normalize_text(value)
+        return (
+            normalized
+            .replace('æ', 'ae')
+            .replace('ø', 'oe')
+            .replace('å', 'aa')
+            .replace('ä', 'ae')
+            .replace('ö', 'oe')
+            .replace('ü', 'ue')
+            .replace('ß', 'ss')
+        )
+
+    @staticmethod
+    def flatten_search_text(value: str) -> str:
+        """Convert Nordic and German letters to simple ASCII approximations."""
+        transliterated = SearchWorker.transliterate_search_text(value)
+        return (
+            transliterated
+            .replace('ae', 'a')
+            .replace('oe', 'o')
+            .replace('ue', 'u')
+            .replace('aa', 'a')
+        )
+
+    @staticmethod
+    def expand_search_variants(value: str) -> List[str]:
+        """Return equivalent variants for Nordic/German letters and common digraph spellings."""
+        normalized = SearchWorker.normalize_text(value)
+        transliterated = SearchWorker.transliterate_search_text(value)
+        flattened = SearchWorker.flatten_search_text(value)
+        variants = [normalized]
+
+        if transliterated not in variants:
+            variants.append(transliterated)
+
+        if flattened not in variants:
+            variants.append(flattened)
+
+        reverse_variant = (
+            transliterated
+            .replace('aa', 'å')
+            .replace('ae', 'æ')
+            .replace('oe', 'ø')
+            .replace('ue', 'ü')
+            .replace('ss', 'ß')
+        )
+        if reverse_variant not in variants:
+            variants.append(reverse_variant)
+
+        swedish_variant = reverse_variant.replace('æ', 'ä').replace('ø', 'ö')
+        if swedish_variant not in variants:
+            variants.append(swedish_variant)
+
+        norwegian_variant = transliterated.replace('ae', 'æ').replace('oe', 'ø').replace('aa', 'å')
+        if norwegian_variant not in variants:
+            variants.append(norwegian_variant)
+
+        return variants
+
+    def build_text_contains_mask(self, series: pd.Series, search_value: str) -> pd.Series:
+        """Match text robustly across Nordic/German letter variants and casing."""
+        normalized_series = series.fillna('').astype(str).map(self.normalize_text)
+        transliterated_series = series.fillna('').astype(str).map(self.transliterate_search_text)
+        flattened_series = series.fillna('').astype(str).map(self.flatten_search_text)
+        mask = pd.Series(False, index=series.index)
+
+        series_variants = [normalized_series, transliterated_series, flattened_series]
+
+        for query_variant in self.expand_search_variants(search_value):
+            for series_variant in series_variants:
+                mask = mask | series_variant.str.contains(query_variant, na=False, regex=False)
+
+        return mask
+
+    @staticmethod
+    def extract_name_tokens(series: pd.Series) -> pd.Series:
+        return series.fillna('').astype(str).map(
+            lambda value: [token for token in re.split(r'\s+', SearchWorker.flatten_search_text(value)) if token]
+        )
+
+    def build_fuzzy_name_mask(self, series: pd.Series, search_value: str) -> pd.Series:
+        query_tokens = [token for token in re.split(r'\s+', self.flatten_search_text(search_value)) if token]
+        if not query_tokens:
+            return pd.Series(False, index=series.index)
+
+        token_series = self.extract_name_tokens(series)
+
+        def row_matches(tokens: List[str]) -> bool:
+            if not tokens:
+                return False
+
+            matched_tokens = 0
+            for query_token in query_tokens:
+                if len(query_token) < 4:
+                    continue
+
+                if any(
+                    (len(candidate) >= 4 and query_token in candidate)
+                    or (len(candidate) >= 4 and SequenceMatcher(None, query_token, candidate).ratio() >= 0.88)
+                    for candidate in tokens
+                ):
+                    matched_tokens += 1
+
+            required_matches = len([token for token in query_tokens if len(token) >= 4])
+            return required_matches > 0 and matched_tokens == required_matches
+
+        return token_series.map(row_matches)
+
+    def get_name_search_series(self, df: pd.DataFrame, canonical_name: str) -> Optional[pd.Series]:
+        """Return a normalized name series for a canonical name field if present."""
+        if canonical_name not in df.columns:
+            return None
+
+        return df[canonical_name].fillna('').astype(str)
+
+    def build_name_mask(self, df: pd.DataFrame, search_value: str, canonical_name: str, allow_loose_match: bool = False) -> pd.Series:
+        """Build a robust mask for first-name/last-name searches."""
+        mask = pd.Series(False, index=df.index)
+
+        direct_series = self.get_name_search_series(df, canonical_name)
+        if direct_series is not None:
+            mask = mask | self.build_text_contains_mask(direct_series, search_value)
+            if allow_loose_match:
+                mask = mask | self.build_fuzzy_name_mask(direct_series, search_value)
+
+        full_name_series = self.get_name_search_series(df, 'Kildenavn')
+        if full_name_series is not None:
+            mask = mask | self.build_text_contains_mask(full_name_series, search_value)
+            if allow_loose_match:
+                mask = mask | self.build_fuzzy_name_mask(full_name_series, search_value)
+
+        return mask
     
     def apply_filters(self, df: pd.DataFrame) -> pd.DataFrame:
         """Apply search filters to dataframe safely"""
@@ -136,28 +445,33 @@ class SearchWorker(QObject):
         # Hjælpefunktion til at konvertere numeriske kolonner sikkert uden at crashe på tekst/spørgsmålstegn
         def safe_to_numeric(series):
             return pd.to_numeric(series.astype(str).str.extract(r'(\d+)', expand=False), errors='coerce')
+
+        def birth_year_series(dataframe: pd.DataFrame) -> pd.Series:
+            """Build a robust birth-year series from Fødeår and Født kildedato."""
+            numeric_year = pd.Series(float('nan'), index=dataframe.index, dtype='float64')
+
+            if 'Fødeår' in dataframe.columns:
+                numeric_year = safe_to_numeric(dataframe['Fødeår'])
+
+            if 'Født kildedato' in dataframe.columns:
+                extracted_year = pd.to_numeric(
+                    dataframe['Født kildedato'].astype(str).str.extract(r'((?:18|19|20)\d{2})', expand=False),
+                    errors='coerce'
+                )
+                numeric_year = numeric_year.fillna(extracted_year)
+
+            return numeric_year
         
         # 1. Fornavn (Tjekker om strengen ikke er tom)
         fornavn = self.search_params.get('fornavn', '')
+        allow_loose_match = bool(self.search_params.get('løs_stavemåde', False))
         if fornavn and str(fornavn).strip():
-            fornavn_filter = str(fornavn).strip().lower()
-            if 'Kildenavn' in filtered.columns:
-                filtered = filtered[
-                    filtered['Kildenavn'].astype(str).str.lower().str.contains(
-                        fornavn_filter, na=False, regex=False
-                    )
-                ]
+            filtered = filtered[self.build_name_mask(filtered, str(fornavn).strip(), 'Fornavn', allow_loose_match)]
         
         # 2. Efternavn
         efternavn = self.search_params.get('efternavn', '')
         if efternavn and str(efternavn).strip():
-            efternavn_filter = str(efternavn).strip().lower()
-            if 'Kildenavn' in filtered.columns:
-                filtered = filtered[
-                    filtered['Kildenavn'].astype(str).str.lower().str.contains(
-                        efternavn_filter, na=False, regex=False
-                    )
-                ]
+            filtered = filtered[self.build_name_mask(filtered, str(efternavn).strip(), 'Efternavn', allow_loose_match)]
 
         # 3. Køn
         køn = self.search_params.get('køn', 'Alle')
@@ -166,11 +480,12 @@ class SearchWorker(QObject):
                 filtered = filtered[filtered['Køn'].astype(str).str.strip() == køn]
         
         # 4. Fødeår
-        if 'Fødeår' in filtered.columns:
-            if self.search_params.get('fødeår_fra') is not None:
-                filtered = filtered[safe_to_numeric(filtered['Fødeår']) >= self.search_params['fødeår_fra']]
-            if self.search_params.get('fødeår_til') is not None:
-                filtered = filtered[safe_to_numeric(filtered['Fødeår']) <= self.search_params['fødeår_til']]
+        birth_year_values = birth_year_series(filtered)
+        if self.search_params.get('fødeår_fra') is not None:
+            filtered = filtered[birth_year_values >= self.search_params['fødeår_fra']]
+            birth_year_values = birth_year_values.loc[filtered.index]
+        if self.search_params.get('fødeår_til') is not None:
+            filtered = filtered[birth_year_values <= self.search_params['fødeår_til']]
         
         # 5. Alder
         if 'Alder' in filtered.columns:
@@ -182,33 +497,237 @@ class SearchWorker(QObject):
         # 6. Fødested
         fødested = self.search_params.get('fødested', '')
         if fødested and str(fødested).strip():
-            birthplace_filter = str(fødested).strip().lower()
             if 'Kildefødested' in filtered.columns:
-                filtered = filtered[
-                    filtered['Kildefødested'].astype(str).str.lower().str.contains(
-                        birthplace_filter, na=False, regex=False
-                    )
-                ]
+                filtered = filtered[self.build_text_contains_mask(filtered['Kildefødested'], str(fødested).strip())]
         
         # 7. Civilstand
         civilstand = self.search_params.get('civilstand', 'Alle')
         if civilstand and civilstand != 'Alle':
             if 'Civilstand' in filtered.columns:
-                filtered = filtered[filtered['Civilstand'].astype(str).str.strip().str.lower() == civilstand.lower()]
+                filtered = filtered[
+                    filtered['Civilstand'].fillna('').astype(str).map(self.normalize_text) == self.normalize_text(civilstand)
+                ]
         
         return filtered
+
+
+class PeriodScanWorker(QObject):
+    """Background worker for period-based name scan with cache and quick file prefilter."""
+    progress = pyqtSignal(int)
+    status_update = pyqtSignal(str)
+    result_ready = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, scan_root: str, period_from: int, period_to: int, search_params: Dict, cache_file: str):
+        super().__init__()
+        self.scan_root = Path(scan_root)
+        self.period_from = min(period_from, period_to)
+        self.period_to = max(period_from, period_to)
+        self.search_params = search_params
+        self.cache_file = Path(cache_file)
+        self.stop_flag = False
+
+    def stop(self):
+        self.stop_flag = True
+
+    def load_cache(self) -> Dict:
+        try:
+            if self.cache_file.exists():
+                with open(self.cache_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def save_cache(self, cache: Dict):
+        try:
+            with open(self.cache_file, 'w', encoding='utf-8') as f:
+                json.dump(cache, f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def build_query_terms(self) -> Set[str]:
+        terms = set()
+
+        for query_key in ['fornavn', 'efternavn']:
+            value = str(self.search_params.get(query_key, '')).strip()
+            if not value:
+                continue
+
+            variants = SearchWorker.expand_search_variants(value)
+            for variant in variants:
+                for token in re.split(r'\s+', variant):
+                    token = token.strip()
+                    if len(token) >= 3:
+                        terms.add(token)
+
+        return terms
+
+    def file_maybe_contains_terms(self, csv_file: Path, terms: Set[str], cache: Dict, terms_key: str) -> bool:
+        if not terms:
+            return True
+
+        try:
+            stat = csv_file.stat()
+            cache_key = f"{csv_file}|{stat.st_size}|{int(stat.st_mtime_ns)}|{terms_key}"
+            if cache_key in cache:
+                return bool(cache[cache_key])
+        except Exception:
+            cache_key = f"{csv_file}|{terms_key}"
+            if cache_key in cache:
+                return bool(cache[cache_key])
+
+        found = False
+        try:
+            with open(csv_file, 'r', encoding='latin-1', errors='ignore') as f:
+                for line in f:
+                    if self.stop_flag:
+                        break
+                    line_folded = line.casefold()
+                    if any(term in line_folded for term in terms):
+                        found = True
+                        break
+        except Exception:
+            # Ved læsefejl lader vi filen gå videre til fuld parse.
+            found = True
+
+        cache[cache_key] = found
+        return found
+
+    def build_summary(self, all_results: List[Dict], scanned_count: int) -> str:
+        fornavn = str(self.search_params.get('fornavn', '')).strip()
+        efternavn = str(self.search_params.get('efternavn', '')).strip()
+
+        if not all_results:
+            return (
+                f"Ingen træffere for '{fornavn} {efternavn}'.\n"
+                f"Periode: {self.period_from}-{self.period_to}\n"
+                f"Scannede filer: {scanned_count}"
+            )
+
+        unique_people = sorted({result.get('Kildenavn', '').strip() for result in all_results if result.get('Kildenavn', '').strip()})
+        unique_files = sorted({result.get('_fil', '').strip() for result in all_results if result.get('_fil', '').strip()})
+
+        period_counts = {}
+        for result in all_results:
+            period = result.get('_periode', 'ukendt')
+            period_counts[period] = period_counts.get(period, 0) + 1
+
+        lines = []
+        lines.append(f"Søgestreng: fornavn='{fornavn}' efternavn='{efternavn}'")
+        lines.append(f"Periode: {self.period_from}-{self.period_to}")
+        lines.append(f"Scannede filer: {scanned_count}")
+        lines.append(f"Træffere: {len(all_results)}")
+        lines.append(f"Unikke personer: {len(unique_people)}")
+        lines.append(f"Filer med træffere: {len(unique_files)}")
+        lines.append("")
+        lines.append("Træffere pr. år:")
+        for year in sorted(period_counts.keys()):
+            lines.append(f"- {year}: {period_counts[year]}")
+        lines.append("")
+        lines.append("Personer (første 50):")
+        for person_name in unique_people[:50]:
+            lines.append(f"- {person_name}")
+        lines.append("")
+        lines.append("Eksempel-træffere (første 30):")
+        for result in all_results[:30]:
+            lines.append(
+                f"- [{result.get('_periode', '')}] {result.get('Kildenavn', 'Ukendt')} | "
+                f"Født: {result.get('Født kildedato', '')} | Fødeår: {result.get('Fødeår', '')} | Fil: {result.get('_fil', '')}"
+            )
+
+        return "\n".join(lines)
+
+    def run(self):
+        try:
+            if not self.scan_root.exists() or not self.scan_root.is_dir():
+                self.result_ready.emit(f"Ugyldig scan-rodmappe: {self.scan_root}")
+                return
+
+            fornavn = str(self.search_params.get('fornavn', '')).strip()
+            efternavn = str(self.search_params.get('efternavn', '')).strip()
+            if not fornavn and not efternavn:
+                self.result_ready.emit("Skriv fornavn eller efternavn i hovedvinduet før du kører periodisk navnescan.")
+                return
+
+            year_dirs = []
+            for folder in self.scan_root.iterdir():
+                if folder.is_dir() and re.fullmatch(r'\d{4}', folder.name):
+                    year = int(folder.name)
+                    if self.period_from <= year <= self.period_to:
+                        year_dirs.append((year, folder))
+
+            if not year_dirs:
+                self.result_ready.emit(
+                    f"Ingen årsmapper fundet i intervallet {self.period_from}-{self.period_to} under {self.scan_root}"
+                )
+                return
+
+            csv_files = []
+            for year, year_dir in sorted(year_dirs):
+                for csv_file in year_dir.glob("**/*.csv"):
+                    csv_files.append((year, csv_file))
+
+            if not csv_files:
+                self.result_ready.emit("Ingen CSV-filer fundet i valgte periode.")
+                return
+
+            terms = self.build_query_terms()
+            terms_key = hashlib.sha1("|".join(sorted(terms)).encode('utf-8')).hexdigest() if terms else "no-terms"
+            cache = self.load_cache()
+
+            self.status_update.emit(
+                f"Periodisk navnescan: {len(csv_files)} filer i {self.period_from}-{self.period_to}..."
+            )
+
+            search_worker = SearchWorker(str(self.scan_root), self.search_params)
+            all_results = []
+
+            for index, (year, csv_file) in enumerate(csv_files, start=1):
+                if self.stop_flag:
+                    self.status_update.emit("Periodisk navnescan annulleret.")
+                    break
+
+                if self.file_maybe_contains_terms(csv_file, terms, cache, terms_key):
+                    file_results = search_worker.search_file(csv_file)
+                    if file_results:
+                        for result in file_results:
+                            result['_periode'] = str(year)
+                        all_results.extend(file_results)
+
+                progress_pct = int((index / len(csv_files)) * 100)
+                self.progress.emit(progress_pct)
+
+                if index % 100 == 0:
+                    self.status_update.emit(
+                        f"Periodisk navnescan: {index}/{len(csv_files)} filer - {len(all_results)} træffere"
+                    )
+
+            self.save_cache(cache)
+            self.result_ready.emit(self.build_summary(all_results, len(csv_files)))
+            self.status_update.emit(
+                f"Periodisk navnescan færdig: {len(all_results)} træffere i {self.period_from}-{self.period_to}"
+            )
+
+        except Exception as exc:
+            self.result_ready.emit(f"Fejl under periodisk navnescan: {exc}")
+        finally:
+            self.finished.emit()
 
 
 class CsvSearcherGUI(QMainWindow):
     """Main GUI window for CSV searcher"""
     
     CACHE_FILE = ".csv_searcher_cache.json"
+    PERIOD_SCAN_CACHE_FILE = ".period_scan_cache.json"
     
     def __init__(self):
         super().__init__()
         self.csv_folder = None
         self.search_thread = None
         self.search_worker = None
+        self.period_scan_thread = None
+        self.period_scan_worker = None
         self.current_results = []
         self.all_columns = []  # Dynamiske kolonner fra CSV-filer
         
@@ -302,6 +821,10 @@ class CsvSearcherGUI(QMainWindow):
         self.birthplace_input = QLineEdit()
         self.birthplace_input.setPlaceholderText("fx. 'København' eller 'Ribe'")
         birthplace_layout.addWidget(self.birthplace_input)
+        self.loose_spelling_check = QCheckBox("Løs stavemåde")
+        self.loose_spelling_check.setChecked(True)
+        self.loose_spelling_check.setToolTip("Finder også nært beslægtede stavemåder af navn og sted")
+        birthplace_layout.addWidget(self.loose_spelling_check)
         birthplace_layout.addStretch()
         
         search_layout.addLayout(birthplace_layout)
@@ -465,6 +988,7 @@ class CsvSearcherGUI(QMainWindow):
             'fødeår_fra': self.year_from.value() if self.year_from.value() > 1700 else None,
             'fødeår_til': self.year_to.value() if self.year_to.value() < 2026 else None,
             'fødested': self.birthplace_input.text(),
+            'løs_stavemåde': self.loose_spelling_check.isChecked(),
         }
         
         self.search_btn.setEnabled(False)
@@ -505,19 +1029,13 @@ class CsvSearcherGUI(QMainWindow):
             self.search_results.clear()
             self.search_results.blockSignals(False)
         
-        # Find all unique columns from results, filtering out complex types and metadata
+        # Find all unique columns from results, excluding internal metadata.
+        # Kolonnevalg må ikke afhænge af celleværdi-længde, da det kan skjule alle kolonner.
         all_cols = set()
         for result in results:
-            for k, v in result.items():
+            for k in result.keys():
                 # Skip internal metadata columns
                 if k.startswith('_'):
-                    continue
-                # Skip complex data types (lists, dicts, etc) - only keep simple types
-                if isinstance(v, (list, dict, tuple)):
-                    continue
-                # Skip if value looks like serialized data (starts with [ or { or contains lots of special chars)
-                v_str = str(v).strip()
-                if v_str.startswith('[') or v_str.startswith('{') or len(v_str) > 500:
                     continue
                 all_cols.add(k)
         
@@ -799,7 +1317,7 @@ class CsvSearcherGUI(QMainWindow):
 
     def filter_results_table(self, search_text: str):
         """Filter results table based on search text"""
-        search_text = search_text.lower().strip()
+        search_text = search_text.strip()
         
         if not hasattr(self, 'results_table') or not self.current_results:
             return
@@ -813,12 +1331,28 @@ class CsvSearcherGUI(QMainWindow):
         
         # Filter results that contain search text
         filtered_results = []
+        search_variants = SearchWorker.expand_search_variants(search_text)
         for result in self.current_results:
             # Search in all visible columns
             found = False
             for value in result.values():
-                if value and search_text in str(value).lower():
-                    found = True
+                if not value:
+                    continue
+
+                normalized_value = SearchWorker.normalize_text(str(value))
+                transliterated_value = SearchWorker.transliterate_search_text(str(value))
+                flattened_value = SearchWorker.flatten_search_text(str(value))
+
+                for variant in search_variants:
+                    if (
+                        variant in normalized_value
+                        or variant in transliterated_value
+                        or variant in flattened_value
+                    ):
+                        found = True
+                        break
+
+                if found:
                     break
             if found:
                 filtered_results.append(result)
@@ -846,6 +1380,112 @@ class CsvSearcherGUI(QMainWindow):
             item = QTableWidgetItem(value)
             self.results_table.setItem(row, col_idx, item)
 
+    def get_period_root_and_years(self) -> Tuple[Path, List[int]]:
+        """Find the closest ancestor folder that contains year folders like 1901, 1930, 1940."""
+        if not self.csv_folder:
+            return Path('.'), []
+
+        current = Path(self.csv_folder)
+        for ancestor in [current] + list(current.parents):
+            try:
+                years = sorted(
+                    int(folder.name)
+                    for folder in ancestor.iterdir()
+                    if folder.is_dir() and re.fullmatch(r'\d{4}', folder.name)
+                )
+                if years:
+                    return ancestor, years
+            except Exception:
+                continue
+
+        return current, []
+
+    def start_period_name_scan(self, scan_root: Path, period_from: int, period_to: int,
+                               output_box: QPlainTextEdit, progress_bar: QProgressBar,
+                               run_button: QPushButton, cancel_button: QPushButton):
+        """Start asynchronous period scan so UI stays responsive."""
+        if self.period_scan_thread and self.period_scan_thread.isRunning():
+            QMessageBox.information(self, "Kører allerede", "Der kører allerede en periode-scan.")
+            return
+
+        search_params = {
+            'fornavn': self.fornavn_input.text().strip(),
+            'efternavn': self.efternavn_input.text().strip(),
+            'køn': 'Alle',
+            'civilstand': 'Alle',
+            'alder_fra': None,
+            'alder_til': None,
+            'fødeår_fra': None,
+            'fødeår_til': None,
+            'fødested': '',
+            'løs_stavemåde': self.loose_spelling_check.isChecked(),
+        }
+
+        output_box.setPlainText("Starter periodisk navnescan...")
+        progress_bar.setValue(0)
+        progress_bar.setVisible(True)
+        run_button.setEnabled(False)
+        cancel_button.setEnabled(True)
+
+        self.period_scan_thread = QThread(self)
+        self.period_scan_worker = PeriodScanWorker(
+            str(scan_root),
+            period_from,
+            period_to,
+            search_params,
+            str(Path(self.PERIOD_SCAN_CACHE_FILE).resolve()),
+        )
+        self.period_scan_worker.moveToThread(self.period_scan_thread)
+
+        def safe_set_enabled(widget, value: bool):
+            try:
+                widget.setEnabled(value)
+            except RuntimeError:
+                pass
+
+        def safe_set_visible(widget, value: bool):
+            try:
+                widget.setVisible(value)
+            except RuntimeError:
+                pass
+
+        def safe_set_value(widget, value: int):
+            try:
+                widget.setValue(value)
+            except RuntimeError:
+                pass
+
+        def safe_set_text(widget, text: str):
+            try:
+                widget.setPlainText(text)
+            except RuntimeError:
+                pass
+
+        self.period_scan_thread.started.connect(self.period_scan_worker.run)
+        self.period_scan_worker.progress.connect(lambda value: safe_set_value(progress_bar, value))
+        self.period_scan_worker.status_update.connect(self.statusBar.showMessage)
+        self.period_scan_worker.result_ready.connect(lambda text: safe_set_text(output_box, text))
+
+        def on_period_worker_finished():
+            safe_set_enabled(run_button, True)
+            safe_set_enabled(cancel_button, False)
+            safe_set_visible(progress_bar, False)
+
+            if self.period_scan_thread and self.period_scan_thread.isRunning():
+                self.period_scan_thread.quit()
+
+        def on_period_thread_finished():
+            self.period_scan_thread = None
+            self.period_scan_worker = None
+
+        self.period_scan_worker.finished.connect(on_period_worker_finished)
+        self.period_scan_thread.finished.connect(on_period_thread_finished)
+        self.period_scan_thread.start()
+
+    def cancel_period_name_scan(self):
+        if self.period_scan_worker:
+            self.period_scan_worker.stop()
+
     def search_finished(self):
         """Called when search is finished"""
         self.search_btn.setEnabled(True)
@@ -856,7 +1496,12 @@ class CsvSearcherGUI(QMainWindow):
             self.search_worker.stop_flag = True
         if self.search_thread and self.search_thread.isRunning():
             self.search_thread.quit()
-            self.search_thread.wait(timeout=2000)
+            self.search_thread.wait(2000)
+        if self.period_scan_worker:
+            self.period_scan_worker.stop()
+        if self.period_scan_thread and self.period_scan_thread.isRunning():
+            self.period_scan_thread.quit()
+            self.period_scan_thread.wait(2000)
         event.accept()
     
     def show_diagnostics(self):
@@ -932,6 +1577,134 @@ class CsvSearcherGUI(QMainWindow):
         cols_scroll.setWidget(cols_widget)
         
         tabs.addTab(cols_scroll, "Kolonner")
+
+        # Tab 3: Aktuel søgning
+        search_scroll = QScrollArea()
+        search_scroll.setWidgetResizable(True)
+        search_widget = QWidget()
+        search_layout = QVBoxLayout()
+
+        current_name_values = [
+            value for value in [self.fornavn_input.text().strip(), self.efternavn_input.text().strip()] if value
+        ]
+        search_title = " ".join(current_name_values) if current_name_values else "Aktuel søgning"
+        summary_text = f"<h2>Diagnostik for: {search_title}</h2>"
+        summary_text += f"<p><b>Løs stavemåde:</b> {'Ja' if self.loose_spelling_check.isChecked() else 'Nej'}</p>"
+        summary_text += f"<p><b>Resultater i hukommelsen:</b> {len(self.current_results)}</p>"
+
+        if self.current_results:
+            unique_files = sorted({result.get('_fil', '') for result in self.current_results if result.get('_fil', '')})
+            unique_names = sorted({result.get('Kildenavn', '') for result in self.current_results if result.get('Kildenavn', '')})
+            year_values = sorted({str(result.get('Fødeår', '')).strip() for result in self.current_results if str(result.get('Fødeår', '')).strip()})
+
+            summary_text += f"<p><b>Unikke personer:</b> {len(unique_names)}</p>"
+            summary_text += f"<p><b>Filer med træffere:</b> {len(unique_files)}</p>"
+            if year_values:
+                summary_text += f"<p><b>Fødeår fundet:</b> {', '.join(year_values[:20])}</p>"
+
+            summary_text += "<h3>Første træffere</h3><ul>"
+            for name in unique_names[:15]:
+                summary_text += f"<li>{name}</li>"
+            summary_text += "</ul>"
+
+            summary_text += "<h3>Filer med træffere</h3><ul>"
+            for file_name in unique_files[:15]:
+                summary_text += f"<li>{file_name}</li>"
+            summary_text += "</ul>"
+        else:
+            summary_text += "<p>Ingen aktuelle resultater. Kør en søgning først for at få navne-, fil- og årsdiagnostik her.</p>"
+
+        search_label = QLabel(summary_text)
+        search_label.setWordWrap(True)
+        search_layout.addWidget(search_label)
+        search_layout.addStretch()
+        search_widget.setLayout(search_layout)
+        search_scroll.setWidget(search_widget)
+        tabs.addTab(search_scroll, "Aktuel søgning")
+
+        # Tab 4: Periodisk navnescan
+        period_scroll = QScrollArea()
+        period_scroll.setWidgetResizable(True)
+        period_widget = QWidget()
+        period_layout = QVBoxLayout()
+
+        root_folder, available_years = self.get_period_root_and_years()
+
+        period_layout.addWidget(QLabel("<h2>Periodisk navnescan</h2>"))
+        period_layout.addWidget(QLabel("Vælg tidsperiode for hvilke årsmappper der skal gennemsøges."))
+
+        root_layout = QHBoxLayout()
+        root_layout.addWidget(QLabel("Rodmappe:"))
+        root_input = QLineEdit(str(root_folder))
+        root_layout.addWidget(root_input)
+        choose_root_btn = QPushButton("Vælg")
+
+        def choose_root_folder():
+            chosen = QFileDialog.getExistingDirectory(diag_window, "Vælg rodmappe med årsmapper")
+            if chosen:
+                root_input.setText(chosen)
+
+        choose_root_btn.clicked.connect(choose_root_folder)
+        root_layout.addWidget(choose_root_btn)
+        period_layout.addLayout(root_layout)
+
+        years_layout = QHBoxLayout()
+        years_layout.addWidget(QLabel("Periode fra:"))
+        period_from_input = QSpinBox()
+        period_from_input.setRange(1700, 2100)
+        years_layout.addWidget(period_from_input)
+        years_layout.addWidget(QLabel("til:"))
+        period_to_input = QSpinBox()
+        period_to_input.setRange(1700, 2100)
+        years_layout.addWidget(period_to_input)
+
+        if available_years:
+            period_from_input.setValue(min(available_years))
+            period_to_input.setValue(max(available_years))
+        else:
+            period_from_input.setValue(1901)
+            period_to_input.setValue(1940)
+
+        period_layout.addLayout(years_layout)
+
+        run_period_scan_btn = QPushButton("Kør navnescan i valgt periode")
+        cancel_period_scan_btn = QPushButton("Annuller scan")
+        cancel_period_scan_btn.setEnabled(False)
+
+        buttons_layout = QHBoxLayout()
+        buttons_layout.addWidget(run_period_scan_btn)
+        buttons_layout.addWidget(cancel_period_scan_btn)
+        buttons_layout.addStretch()
+        period_layout.addLayout(buttons_layout)
+
+        period_progress = QProgressBar()
+        period_progress.setVisible(False)
+        period_layout.addWidget(period_progress)
+
+        period_output = QPlainTextEdit()
+        period_output.setReadOnly(True)
+        period_output.setPlaceholderText("Resultat af periodisk navnescan vises her...")
+        period_layout.addWidget(period_output)
+
+        def run_selected_period_scan():
+            scan_root = Path(root_input.text().strip())
+            self.start_period_name_scan(
+                scan_root,
+                period_from_input.value(),
+                period_to_input.value(),
+                period_output,
+                period_progress,
+                run_period_scan_btn,
+                cancel_period_scan_btn,
+            )
+
+        run_period_scan_btn.clicked.connect(run_selected_period_scan)
+        cancel_period_scan_btn.clicked.connect(self.cancel_period_name_scan)
+
+        period_widget.setLayout(period_layout)
+        period_scroll.setWidget(period_widget)
+        tabs.addTab(period_scroll, "Periode-scan")
+
         layout.addWidget(tabs)
         
         close_btn = QPushButton("Luk")
