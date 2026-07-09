@@ -842,6 +842,11 @@ class CsvSearcherGUI(QMainWindow):
         debug_btn.clicked.connect(self.show_diagnostics)
         debug_btn.setStyleSheet("background-color: #2196F3; color: white; padding: 10px;")
         main_layout.addWidget(debug_btn)
+
+        variant_btn = QPushButton("🔎 Find efternavn-varianter (1940)")
+        variant_btn.clicked.connect(self.find_surname_variants_1940)
+        variant_btn.setStyleSheet("background-color: #607D8B; color: white; padding: 10px;")
+        main_layout.addWidget(variant_btn)
         
         # File browser button
         file_btn = QPushButton("📁 Se Filer")
@@ -1132,6 +1137,93 @@ class CsvSearcherGUI(QMainWindow):
         
         file_window.setLayout(layout)
         file_window.exec_()
+
+    @staticmethod
+    def _normalize_household_value(value) -> str:
+        """Normalize values used for household matching."""
+        if value is None:
+            return ''
+
+        text = str(value).strip()
+        if not text or text.lower() == 'nan':
+            return ''
+
+        text = unicodedata.normalize('NFKC', text)
+        text = re.sub(r'\s+', ' ', text)
+        return text.casefold()
+
+    def _find_household_members(self, person: Dict, husstands_nr: str) -> Tuple[List[Dict], int]:
+        """Find household members using household number plus contextual narrowing fields."""
+        hele_filen = person.get('_hele_filen', [])
+        if not hele_filen:
+            return [], 0
+
+        normalized_husstands_nr = self._normalize_household_value(husstands_nr)
+        if not normalized_husstands_nr:
+            return [], 0
+
+        candidates = [
+            member for member in hele_filen
+            if self._normalize_household_value(member.get('Husstands/familienr.', '')) == normalized_husstands_nr
+        ]
+
+        initial_count = len(candidates)
+        if initial_count <= 1:
+            return candidates, initial_count
+
+        def same_person_identity(member: Dict) -> bool:
+            """Best-effort identity check so we can keep only the selected person when key is ambiguous."""
+            identity_fields = ['KIPnr', 'Løbenr', 'Lobenr', 'L�benr', 'Kildenavn']
+            for field in identity_fields:
+                person_value = self._normalize_household_value(person.get(field, ''))
+                member_value = self._normalize_household_value(member.get(field, ''))
+                if person_value and member_value and person_value != member_value:
+                    return False
+            return True
+
+        # Narrow broad matches (e.g., reused household number across places in one file).
+        # Start with specific address/form fields, then broader location fields.
+        context_fields = [
+            'Matr.nr./Adresse', 'Matr.nr / Adresse', 'Adresse', 'Matrikel', 'Matr. nr', 'Matr nr',
+            'Gade nr.', 'Gade', 'Husnr', 'Hus nr', 'Etage', 'Forhus/Baghus',
+            'Skemanr', 'Skema lbnr.', 'Skema lbnr',
+            'Kildestednavn', 'Sogn', 'Sogne', 'Sognenavn', 'Herred', 'Amt', 'Kreds',
+            'Bynavn', 'By', 'Ejendom', 'Stednr', 'Stednr.', 'Sted'
+        ]
+
+        narrowed = candidates
+        for field in context_fields:
+            person_value = self._normalize_household_value(person.get(field, ''))
+            if not person_value:
+                continue
+
+            distinct_values = {
+                self._normalize_household_value(member.get(field, ''))
+                for member in narrowed
+                if self._normalize_household_value(member.get(field, ''))
+            }
+
+            if len(distinct_values) <= 1 or person_value not in distinct_values:
+                continue
+
+            next_narrowed = [
+                member for member in narrowed
+                if self._normalize_household_value(member.get(field, '')) == person_value
+            ]
+
+            if next_narrowed:
+                narrowed = next_narrowed
+
+        # If this still looks like an over-broad descriptor (e.g. "forhus 1 fam" with 100+ rows),
+        # prefer returning only the selected person instead of a misleading giant "household".
+        looks_generic_label = bool(re.search(r'[a-zA-ZæøåÆØÅ]', husstands_nr))
+        if len(narrowed) >= 50 and looks_generic_label:
+            fallback = [member for member in narrowed if same_person_identity(member)]
+            if fallback:
+                return fallback[:1], initial_count
+            return [person], initial_count
+
+        return narrowed, initial_count
     
     def show_details(self):
         """Show detailed view for selected person and their household"""
@@ -1196,17 +1288,19 @@ class CsvSearcherGUI(QMainWindow):
             household_scroll.setWidgetResizable(True)
             household_widget = QWidget()
             household_layout = QVBoxLayout()
-            
-            hele_filen = person.get('_hele_filen', [])
-            household_members = []
-            
-            if hele_filen:
-                for member in hele_filen:
-                    if str(member.get('Husstands/familienr.', '')).strip() == husstands_nr:
-                        household_members.append(member)
+
+            household_members, initial_household_count = self._find_household_members(person, husstands_nr)
             
             if household_members:
                 household_layout.addWidget(QLabel(f"<h2>Husstanden ({len(household_members)} personer)</h2>"))
+
+                if initial_household_count > len(household_members):
+                    household_layout.addWidget(
+                        QLabel(
+                            "<p><i>Viser kun medlemmer med samme husstandsnummer "
+                            "og samme sted/adressekontekst for at undgå overmatch.</i></p>"
+                        )
+                    )
                 
                 household_table = QTableWidget()
                 # Dynamisk kolonner til husstanden
@@ -1379,6 +1473,184 @@ class CsvSearcherGUI(QMainWindow):
                     value = ''
             item = QTableWidgetItem(value)
             self.results_table.setItem(row, col_idx, item)
+
+    def find_surname_variants_1940(self):
+        """Scan 1940 data and find likely surname variants for current last-name query."""
+        query = self.efternavn_input.text().strip()
+        if not query:
+            QMessageBox.warning(self, "Mangler efternavn", "Skriv et efternavn først i feltet 'Efternavn'.")
+            return
+
+        root_folder, _ = self.get_period_root_and_years()
+        year_folder = root_folder / '1940'
+        if not year_folder.exists():
+            QMessageBox.warning(
+                self,
+                "1940 ikke fundet",
+                f"Kunne ikke finde årsmappen 1940 under: {root_folder}"
+            )
+            return
+
+        scan_folder = year_folder / 'ddd-ansi'
+        if not scan_folder.exists():
+            scan_folder = year_folder
+
+        csv_files = sorted(scan_folder.glob('**/*.csv'))
+        if not csv_files:
+            QMessageBox.warning(self, "Ingen filer", f"Ingen CSV-filer fundet under: {scan_folder}")
+            return
+
+        query_norm = SearchWorker.flatten_search_text(query)
+        query_exact_norm = SearchWorker.normalize_text(query)
+
+        def extract_tokens(name_value: str) -> List[str]:
+            cleaned = re.sub(r"[^\w\s\-ÆØÅæøåÄÖÜäöüß]", " ", str(name_value))
+            tokens = [token.strip("-") for token in cleaned.split() if token.strip("-")]
+            return [token for token in tokens if len(token) >= 3]
+
+        def similarity_score(token: str) -> float:
+            token_exact = SearchWorker.normalize_text(token)
+            token_norm = SearchWorker.flatten_search_text(token)
+            if not token_norm or len(token_norm) < 3:
+                return 0.0
+
+            if query_exact_norm and (query_exact_norm in token_exact or token_exact in query_exact_norm):
+                return 1.0
+            else:
+                score = SequenceMatcher(None, query_norm, token_norm).ratio()
+
+            if token_norm and query_norm and token_norm[0] == query_norm[0]:
+                score += 0.03
+
+            return min(1.0, score)
+
+        variants: Dict[str, Dict] = {}
+        names_scanned = 0
+        row_hits = 0
+
+        self.statusBar.showMessage(f"Scanner 1940-navnevarianter i {len(csv_files)} filer...")
+
+        for file_index, csv_file in enumerate(csv_files, start=1):
+            try:
+                with open(csv_file, 'r', encoding='latin-1', errors='replace') as csvfile:
+                    reader = csv.DictReader(csvfile, delimiter=';')
+                    if not reader.fieldnames:
+                        continue
+
+                    name_column = 'Kildenavn'
+                    if name_column not in reader.fieldnames:
+                        matching_name_cols = [col for col in reader.fieldnames if SearchWorker.normalize_key(col) == 'kildenavn']
+                        if matching_name_cols:
+                            name_column = matching_name_cols[0]
+                        else:
+                            continue
+
+                    for row in reader:
+                        full_name = str(row.get(name_column, '')).strip()
+                        if not full_name:
+                            continue
+
+                        names_scanned += 1
+                        tokens = extract_tokens(full_name)
+                        if not tokens:
+                            continue
+
+                        best_token = None
+                        best_score = 0.0
+                        for token in tokens:
+                            score = similarity_score(token)
+                            if score > best_score:
+                                best_score = score
+                                best_token = token
+
+                        if not best_token:
+                            continue
+
+                        row_hits += 1
+                        token_key = SearchWorker.flatten_search_text(best_token)
+                        if token_key not in variants:
+                            variants[token_key] = {
+                                'display': best_token,
+                                'count': 0,
+                                'best_score': 0.0,
+                                'examples': set(),
+                                'files': set(),
+                            }
+
+                        entry = variants[token_key]
+                        entry['count'] += 1
+                        entry['best_score'] = max(entry['best_score'], best_score)
+                        if len(entry['examples']) < 5:
+                            entry['examples'].add(full_name)
+                        if len(entry['files']) < 5:
+                            entry['files'].add(csv_file.name)
+            except Exception:
+                continue
+
+            if file_index % 100 == 0:
+                self.statusBar.showMessage(
+                    f"Scanner 1940-navnevarianter: {file_index}/{len(csv_files)} filer..."
+                )
+                QApplication.processEvents()
+
+        ranked = sorted(
+            variants.values(),
+            key=lambda item: (item['best_score'], item['count']),
+            reverse=True,
+        )
+
+        report_lines = []
+        report_lines.append(f"Efternavn-variantscan for 1940: '{query}'")
+        report_lines.append(f"Scanmappe: {scan_folder}")
+        report_lines.append(f"Scannede filer: {len(csv_files)}")
+        report_lines.append(f"Scannede navnerækker: {names_scanned}")
+        report_lines.append(f"Rækker med variantmatch: {row_hits}")
+        report_lines.append(f"Unikke varianter: {len(ranked)}")
+        report_lines.append("")
+
+        if not ranked:
+            report_lines.append("Ingen efternavn-varianter fundet i 1940.")
+            report_lines.append("Det tyder på, at navnet ikke er registreret i 1940-datasættet under en tæt stavemåde.")
+        else:
+            report_lines.append("Top varianter:")
+            for idx, entry in enumerate(ranked[:50], start=1):
+                examples = '; '.join(sorted(entry['examples']))
+                files = ', '.join(sorted(entry['files']))
+                report_lines.append(
+                    f"{idx:2d}. {entry['display']} | score={entry['best_score']:.2f} | "
+                    f"antal={entry['count']} | filer={files}"
+                )
+                if examples:
+                    report_lines.append(f"    Eksempler: {examples}")
+
+            top_score = ranked[0]['best_score']
+            if top_score < 0.80:
+                report_lines.append("")
+                report_lines.append(
+                    "Bemærk: de bedste kandidater ligger langt fra det søgte efternavn, "
+                    "så et ægte Oehlerich-hit ser ikke ud til at eksistere i 1940." 
+                )
+
+        report_text = "\n".join(report_lines)
+
+        result_dialog = QDialog(self)
+        result_dialog.setWindowTitle("Efternavn-varianter i 1940")
+        result_dialog.setGeometry(120, 120, 1000, 700)
+        dialog_layout = QVBoxLayout()
+
+        text_box = QPlainTextEdit()
+        text_box.setReadOnly(True)
+        text_box.setPlainText(report_text)
+        dialog_layout.addWidget(text_box)
+
+        close_btn = QPushButton("Luk")
+        close_btn.clicked.connect(result_dialog.close)
+        dialog_layout.addWidget(close_btn)
+
+        result_dialog.setLayout(dialog_layout)
+        result_dialog.exec_()
+
+        self.statusBar.showMessage("1940 efternavn-variantscan færdig.")
 
     def get_period_root_and_years(self) -> Tuple[Path, List[int]]:
         """Find the closest ancestor folder that contains year folders like 1901, 1930, 1940."""
