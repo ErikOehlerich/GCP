@@ -763,6 +763,25 @@ class SurnameVariantScanWorker(QObject):
 
         return min(1.0, score)
 
+    @staticmethod
+    def format_person_line(full_name: str, row: Dict, file_name: str) -> str:
+        parts = [full_name.strip()]
+
+        status = str(row.get('Stilling_i_husstanden', '')).strip()
+        if status:
+            parts.append(status)
+
+        location = str(row.get('Kildestednavn', '')).strip()
+        if location:
+            parts.append(location)
+
+        birth_year = str(row.get('Fødeår', '')).strip()
+        if birth_year:
+            parts.append(f"f. {birth_year}")
+
+        parts.append(file_name)
+        return " | ".join(parts)
+
     def build_report(self, variants: List[Dict], csv_count: int, rows_scanned: int, matches: int) -> str:
         lines = []
         lines.append(f"Efternavn-variantscan for {self.scan_label}: '{self.query}'")
@@ -781,6 +800,7 @@ class SurnameVariantScanWorker(QObject):
         lines.append("Top varianter:")
         for idx, entry in enumerate(variants[:50], start=1):
             examples = '; '.join(sorted(entry['examples']))
+            people = entry.get('people', [])
             files = ', '.join(sorted(entry['files']))
             lines.append(
                 f"{idx:2d}. {entry['display']} | score={entry['best_score']:.2f} | "
@@ -788,6 +808,12 @@ class SurnameVariantScanWorker(QObject):
             )
             if examples:
                 lines.append(f"    Eksempler: {examples}")
+            if people:
+                lines.append("    Personer:")
+                for person_line in people[:10]:
+                    lines.append(f"      - {person_line}")
+                if len(people) > 10:
+                    lines.append(f"      ... og {len(people) - 10} flere personer")
 
         top_score = variants[0]['best_score']
         if top_score < 0.80:
@@ -866,6 +892,7 @@ class SurnameVariantScanWorker(QObject):
                                     'best_score': 0.0,
                                     'examples': set(),
                                     'files': set(),
+                                    'people': [],
                                 }
 
                             entry = variants[token_key]
@@ -875,6 +902,8 @@ class SurnameVariantScanWorker(QObject):
                                 entry['examples'].add(full_name)
                             if len(entry['files']) < 5:
                                 entry['files'].add(csv_file.name)
+                            if len(entry['people']) < 25:
+                                entry['people'].append(self.format_person_line(full_name, row, csv_file.name))
                 except Exception:
                     continue
 
