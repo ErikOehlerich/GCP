@@ -1,3 +1,14 @@
+GCP eller General Census Program er et program som er designet til at fungere som en nøddeknækker, når man ikke ved, hvor en person er.
+
+Man kan sidde og lede i andre hjemmesider og programmer, men man kan kun søge i enkelte sogne efter folk. Dette program er skabt til at gøre processen nemmere.
+
+Da man i stedet for at søge i et enkelt sogn eller amt nu har mulighed for at søge i en hel folketælling på tværs af sogne, amter og regioner.
+
+Man brute-forcer sig igennem problemet, hvilket også er grunden til at jeg kalder programmet for en nøddeknækker, hver søgning tager ca. 15 sekunder,
+
+Men man søger på tværs i en samlet folketælling.
+
+
 # Folketællings-søger 🇩🇰
 
 Et Python-baseret desktop program til at søge parallelt i tusinder af CSV-filer med danske folketal-data.
