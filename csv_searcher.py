@@ -11,6 +11,7 @@ import re
 import unicodedata
 import warnings
 import hashlib
+import copy
 from difflib import SequenceMatcher
 import pandas as pd
 from pandas.errors import ParserWarning
@@ -132,6 +133,42 @@ class SearchWorker(QObject):
                     print(f"Fejl ved søgning: {e}")
             
             self.results.emit(all_results)
+
+            # Automatic fallback: if no hits, retry with relaxed non-name filters.
+            fornavn = str(self.search_params.get('fornavn', '')).strip()
+            efternavn = str(self.search_params.get('efternavn', '')).strip()
+            if not all_results and (fornavn or efternavn):
+                self.status_update.emit("Ingen fundet. Prøver automatisk en bredere navnesøgning...")
+
+                original_params = self.search_params
+                relaxed_params = copy.deepcopy(self.search_params)
+                relaxed_params['køn'] = 'Alle'
+                relaxed_params['civilstand'] = 'Alle'
+                relaxed_params['alder_fra'] = None
+                relaxed_params['alder_til'] = None
+                relaxed_params['fødeår_fra'] = None
+                relaxed_params['fødeår_til'] = None
+                relaxed_params['fødested'] = ''
+                relaxed_params['løs_stavemåde'] = True
+                self.search_params = relaxed_params
+
+                relaxed_results = []
+                for csv_file in csv_files:
+                    if self.stop_flag:
+                        break
+                    try:
+                        file_results = self.search_file(csv_file)
+                        if file_results:
+                            relaxed_results.extend(file_results)
+                    except Exception as e:
+                        print(f"Fejl ved fallback-søgning: {e}")
+
+                self.search_params = original_params
+
+                if relaxed_results:
+                    all_results = relaxed_results
+                    self.results.emit(all_results)
+
             self.status_update.emit(
                 f"Søgning færdig! Fundet {len(all_results)} resultater"
             )
@@ -379,6 +416,18 @@ class SearchWorker(QObject):
 
         return mask
 
+    def build_text_all_tokens_mask(self, series: pd.Series, search_value: str) -> pd.Series:
+        """Require all query tokens to match, independent of token order."""
+        tokens = [token for token in re.split(r'\s+', str(search_value).strip()) if token]
+        if not tokens:
+            return pd.Series(False, index=series.index)
+
+        mask = pd.Series(True, index=series.index)
+        for token in tokens:
+            mask = mask & self.build_text_contains_mask(series, token)
+
+        return mask
+
     @staticmethod
     def extract_name_tokens(series: pd.Series) -> pd.Series:
         return series.fillna('').astype(str).map(
@@ -420,21 +469,54 @@ class SearchWorker(QObject):
 
         return df[canonical_name].fillna('').astype(str)
 
+    def get_fallback_name_series(self, df: pd.DataFrame) -> List[pd.Series]:
+        """Return candidate name-like columns when canonical headers are missing."""
+        fallback_tokens = [
+            'navn', 'name', 'person', 'fornavn', 'efternavn',
+            'surname', 'lastname', 'familyname', 'givenname'
+        ]
+
+        candidate_series: List[pd.Series] = []
+        seen_columns = set()
+
+        for column in df.columns:
+            normalized_col = self.normalize_key(column)
+            if any(token in normalized_col for token in fallback_tokens):
+                candidate_series.append(df[column].fillna('').astype(str))
+                seen_columns.add(column)
+
+        # Extra fallback: include the first text columns to avoid false zero matches
+        # on files with uncommon headers.
+        if not candidate_series:
+            for column in list(df.columns)[:5]:
+                if column in seen_columns:
+                    continue
+                candidate_series.append(df[column].fillna('').astype(str))
+
+        return candidate_series
+
     def build_name_mask(self, df: pd.DataFrame, search_value: str, canonical_name: str, allow_loose_match: bool = False) -> pd.Series:
         """Build a robust mask for first-name/last-name searches."""
         mask = pd.Series(False, index=df.index)
 
         direct_series = self.get_name_search_series(df, canonical_name)
         if direct_series is not None:
-            mask = mask | self.build_text_contains_mask(direct_series, search_value)
+            mask = mask | self.build_text_all_tokens_mask(direct_series, search_value)
             if allow_loose_match:
                 mask = mask | self.build_fuzzy_name_mask(direct_series, search_value)
 
         full_name_series = self.get_name_search_series(df, 'Kildenavn')
         if full_name_series is not None:
-            mask = mask | self.build_text_contains_mask(full_name_series, search_value)
+            mask = mask | self.build_text_all_tokens_mask(full_name_series, search_value)
             if allow_loose_match:
                 mask = mask | self.build_fuzzy_name_mask(full_name_series, search_value)
+
+        # Fallback for unexpected header names.
+        if not bool(mask.any()):
+            for fallback_series in self.get_fallback_name_series(df):
+                mask = mask | self.build_text_all_tokens_mask(fallback_series, search_value)
+                if allow_loose_match:
+                    mask = mask | self.build_fuzzy_name_mask(fallback_series, search_value)
 
         return mask
     

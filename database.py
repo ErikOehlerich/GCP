@@ -10,7 +10,7 @@ import json
 import pandas as pd
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, cast
 import threading
 from queue import Queue
 import time
@@ -37,6 +37,7 @@ try:
     HAS_FOLIUM = True
 except ImportError:
     HAS_FOLIUM = False
+    folium = None
 
 try:
     from geopy.geocoders import Nominatim  # type: ignore
@@ -141,7 +142,11 @@ class SearchWorker(QObject):
                 filtered_df['_fulsti'] = str(csv_file)
                 
                 # SIKKER FIX: Ganger listen med rå-rækker op med længden af det filtrerede dataframe
-                filtered_df['_hele_filen'] = [rows] * len(filtered_df)
+                filtered_df['_hele_filen'] = pd.Series(
+                    [rows for _ in range(len(filtered_df))],
+                    index=filtered_df.index,
+                    dtype='object'
+                )
                 
                 results = filtered_df.to_dict('records')
             
@@ -164,8 +169,8 @@ class SearchWorker(QObject):
             fornavn_filter = str(fornavn).strip().lower()
             if 'Kildenavn' in filtered.columns:
                 filtered = filtered[
-                    filtered['Kildenavn'].astype(str).str.lower().str.contains(
-                        fornavn_filter, na=False, regex=False
+                    filtered['Kildenavn'].apply(
+                        lambda x: fornavn_filter in str(x).lower()
                     )
                 ]
         
@@ -175,8 +180,8 @@ class SearchWorker(QObject):
             efternavn_filter = str(efternavn).strip().lower()
             if 'Kildenavn' in filtered.columns:
                 filtered = filtered[
-                    filtered['Kildenavn'].astype(str).str.lower().str.contains(
-                        efternavn_filter, na=False, regex=False
+                    filtered['Kildenavn'].apply(
+                        lambda x: efternavn_filter in str(x).lower()
                     )
                 ]
 
@@ -184,7 +189,9 @@ class SearchWorker(QObject):
         køn = self.search_params.get('køn', 'Alle')
         if køn and køn != 'Alle':
             if 'Køn' in filtered.columns:
-                filtered = filtered[filtered['Køn'].astype(str).str.strip() == køn]
+                filtered = filtered[
+                    filtered['Køn'].apply(lambda x: str(x).strip() == køn)
+                ]
         
         # 4. Fødeår
         if 'Fødeår' in filtered.columns:
@@ -206,8 +213,8 @@ class SearchWorker(QObject):
             birthplace_filter = str(fødested).strip().lower()
             if 'Kildefødested' in filtered.columns:
                 filtered = filtered[
-                    filtered['Kildefødested'].astype(str).str.lower().str.contains(
-                        birthplace_filter, na=False, regex=False
+                    filtered['Kildefødested'].apply(
+                        lambda x: birthplace_filter in str(x).lower()
                     )
                 ]
         
@@ -215,9 +222,13 @@ class SearchWorker(QObject):
         civilstand = self.search_params.get('civilstand', 'Alle')
         if civilstand and civilstand != 'Alle':
             if 'Civilstand' in filtered.columns:
-                filtered = filtered[filtered['Civilstand'].astype(str).str.strip().str.lower() == civilstand.lower()]
+                filtered = filtered[
+                    filtered['Civilstand'].apply(
+                        lambda x: str(x).strip().lower() == civilstand.lower()
+                    )
+                ]
         
-        return filtered
+        return cast(pd.DataFrame, filtered)
 
 
 class CsvSearcherGUI(QMainWindow):
@@ -422,9 +433,9 @@ class CsvSearcherGUI(QMainWindow):
         central_widget.setLayout(main_layout)
         
         # Status bar
-        self.statusBar = QStatusBar()
-        self.setStatusBar(self.statusBar)
-        self.statusBar.showMessage("Klar til søgning...")
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage("Klar til søgning...")
     
 
     def get_all_columns(self) -> List[str]:
@@ -455,7 +466,7 @@ class CsvSearcherGUI(QMainWindow):
             self.csv_folder = folder
             self.folder_label.setText(folder)
             csv_count = len(list(Path(folder).glob("**/*.csv")))
-            self.statusBar.showMessage(f"Mappen indeholder {csv_count} CSV-filer")
+            self.status_bar.showMessage(f"Mappen indeholder {csv_count} CSV-filer")
             self.save_cache()
     
     def load_cache(self):
@@ -470,7 +481,7 @@ class CsvSearcherGUI(QMainWindow):
                         self.csv_folder = cached_folder
                         self.folder_label.setText(cached_folder)
                         csv_count = len(list(Path(cached_folder).glob("**/*.csv")))
-                        self.statusBar.showMessage(f"Mappen indeholder {csv_count} CSV-filer (gendannet fra cache)")
+                        self.status_bar.showMessage(f"Mappen indeholder {csv_count} CSV-filer (gendannet fra cache)")
         except Exception as e:
             print(f"Fejl ved indlæsning af cache: {e}")
     
@@ -508,7 +519,8 @@ class CsvSearcherGUI(QMainWindow):
         self.current_results = []
         
         if self.search_thread is not None and self.search_thread.isRunning():
-            self.search_worker.stop_flag = True
+            if self.search_worker is not None:
+                self.search_worker.stop_flag = True
             self.search_thread.quit()
             self.search_thread.wait()
         
@@ -528,7 +540,7 @@ class CsvSearcherGUI(QMainWindow):
         self.progress_bar.setValue(value)
     
     def update_status(self, message: str):
-        self.statusBar.showMessage(message)
+        self.status_bar.showMessage(message)
     
     def display_results(self, results: List[Dict]):
         """Display search results in table with all columns"""
@@ -646,7 +658,7 @@ class CsvSearcherGUI(QMainWindow):
         layout.addWidget(QLabel(stats_text))
         
         close_btn = QPushButton("Luk")
-        close_btn.clicked.connect(file_window.close)
+        close_btn.clicked.connect(file_window.accept)
         layout.addWidget(close_btn)
         
         file_window.setLayout(layout)
@@ -658,10 +670,14 @@ class CsvSearcherGUI(QMainWindow):
             QMessageBox.warning(self, "Fejl", "Udfør først en søgning!")
             return
         
-        if not HAS_FOLIUM or not HAS_GEOPY:
+        if not HAS_FOLIUM or not HAS_GEOPY or not HAS_WEBENGINE:
             QMessageBox.warning(self, "Fejl", 
-                "Kort-funktionen kræver 'folium' og 'geopy'.\n"
-                "Installér med: pip install folium geopy")
+                "Kort-funktionen kræver 'folium', 'geopy' og 'PyQtWebEngine'.\n"
+                "Installér med: pip install folium geopy pyqtwebengine")
+            return
+
+        if Nominatim is None or folium is None or QWebEngineView is None:
+            QMessageBox.warning(self, "Fejl", "Kort-komponenter er ikke tilgængelige i det valgte Python-miljø.")
             return
         
         try:
@@ -754,7 +770,7 @@ class CsvSearcherGUI(QMainWindow):
             
             # Close button
             close_btn = QPushButton("Luk")
-            close_btn.clicked.connect(map_dialog.close)
+            close_btn.clicked.connect(map_dialog.accept)
             layout.addWidget(close_btn)
             
             map_dialog.setLayout(layout)
@@ -854,16 +870,20 @@ class CsvSearcherGUI(QMainWindow):
     
     def _perform_group_search(self, names: List[str], same_household: bool):
         """Perform the actual group search across CSV files"""
+        all_results: List[Dict] = []
         try:
+            if not self.csv_folder:
+                self.status_bar.showMessage("Fejl: Ingen CSV-mappe valgt")
+                return
+
             self.search_btn.setEnabled(False)
             self.progress_bar.setVisible(True)
             self.progress_bar.setValue(0)
             self.results_table.setRowCount(0)
             self.current_results = []
-            self.statusBar.showMessage(f"Søger efter gruppe: {', '.join(names)}...")
+            self.status_bar.showMessage(f"Søger efter gruppe: {', '.join(names)}...")
             
             csv_files = list(Path(self.csv_folder).glob("**/*.csv"))
-            all_results = []
             processed = 0
             total_files = len(csv_files)
             
@@ -885,7 +905,7 @@ class CsvSearcherGUI(QMainWindow):
                     self.progress_bar.setValue(progress_pct)
                     
                     if processed % 50 == 0:
-                        self.statusBar.showMessage(
+                        self.status_bar.showMessage(
                             f"Behandlet {processed}/{total_files} filer - "
                             f"Fundet {len(all_results)} personer"
                         )
@@ -933,11 +953,11 @@ class CsvSearcherGUI(QMainWindow):
             
             all_results = filtered_results
             result_message = f"Fundet {len(all_results)} personer i husstande med alle søgte"
-            self.statusBar.showMessage(result_message)
+            self.status_bar.showMessage(result_message)
             
             
         except Exception as e:
-            self.statusBar.showMessage(f'Fejl ved gruppesøgning: {e}')
+            self.status_bar.showMessage(f'Fejl ved gruppesøgning: {e}')
             print(f'Gruppesøgning fejl: {e}')
         finally:
             self.search_btn.setEnabled(True)
@@ -1042,11 +1062,19 @@ class CsvSearcherGUI(QMainWindow):
             
             hele_filen = person.get('_hele_filen', [])
             household_members = []
+            csv_path: Optional[str] = None
             
 
             # If _hele_filen is not available, read the CSV file
-            if not hele_filen and person.get("_sti"):
+            if not hele_filen:
                 csv_path = person.get("_sti")
+                if not isinstance(csv_path, str) or not csv_path:
+                    csv_path = person.get("_fulsti")
+
+                if not isinstance(csv_path, str) or not csv_path:
+                    csv_path = None
+
+            if not hele_filen and csv_path:
                 try:
                     with open(csv_path, "r", encoding="latin-1", errors="replace") as f:
                         import csv as csv_module
@@ -1146,7 +1174,7 @@ class CsvSearcherGUI(QMainWindow):
         layout.addWidget(tabs)
         
         close_btn = QPushButton("Luk")
-        close_btn.clicked.connect(detail_window.close)
+        close_btn.clicked.connect(detail_window.accept)
         layout.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignRight)
         
         detail_window.setLayout(layout)
@@ -1243,13 +1271,13 @@ class CsvSearcherGUI(QMainWindow):
         self.search_btn.setEnabled(True)
         self.progress_bar.setVisible(False)
     
-    def closeEvent(self, event):
+    def closeEvent(self, a0):
         if self.search_worker:
             self.search_worker.stop_flag = True
         if self.search_thread and self.search_thread.isRunning():
             self.search_thread.quit()
             self.search_thread.wait(2000)
-        event.accept()
+        a0.accept()
     
     def show_diagnostics(self):
         """Show diagnostics window with dataset info"""
@@ -1327,7 +1355,7 @@ class CsvSearcherGUI(QMainWindow):
         layout.addWidget(tabs)
         
         close_btn = QPushButton("Luk")
-        close_btn.clicked.connect(diag_window.close)
+        close_btn.clicked.connect(diag_window.accept)
         layout.addWidget(close_btn)
         
         diag_window.setLayout(layout)
