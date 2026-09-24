@@ -1314,6 +1314,9 @@ class CsvSearcherGUI(QMainWindow):
         self.search_worker.results.connect(self.display_results)
         self.search_worker.status_update.connect(self.update_status)
         self.search_worker.finished.connect(self.search_finished)
+        self.search_worker.finished.connect(self.search_thread.quit)
+        self.search_worker.finished.connect(self.search_worker.deleteLater)
+        self.search_thread.finished.connect(self.search_thread.deleteLater)
         
         self.search_thread.start()
     
