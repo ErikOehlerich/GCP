@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 cd /home/user/Dokumenter/GitHub/GCP
 source .venv/bin/activate
-exec python csv_searcher.py
+python csv_searcher.py
