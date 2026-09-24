@@ -241,7 +241,7 @@ class SearchWorker(QObject):
                     if df is None or df.empty:
                         continue
 
-                    # Normaliser kolonnenavne tidligt så vi kan score på reelle nøglefelter.
+                    # Normaliser kolonnenavne tidigt så vi kan score på reelle nøglefelter.
                     df.columns = df.columns.astype(str).str.replace('\ufeff', '', regex=False).str.strip()
                     df = self.canonicalize_columns(df)
 
