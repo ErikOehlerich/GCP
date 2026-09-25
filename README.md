@@ -13,6 +13,9 @@ Til gengæld søger man på tværs i en samlet folketælling, hvilket gør, at m
 
 Et Python-baseret desktop program til at søge parallelt i tusinder af CSV-filer med danske folketal-data.
 
+Man kan hente folketællingerne i csvformat fra Salldata til personligt research ved
+http://salldata.dk/zip/login.php
+
 ## Features ✨
 
 - **Parallel søgning** - Søger i flere CSV-filer samtidigt (ThreadPoolExecutor)
