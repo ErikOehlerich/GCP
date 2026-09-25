@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.csv_searcher_cache.json
+.period_scan_cache.json
+.DS_Store
